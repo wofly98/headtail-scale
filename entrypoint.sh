@@ -31,21 +31,17 @@ const net = require('net');
 const TARGET_PORT = 8081;
 const TARGET_HOST = '127.0.0.1';
 
-function log(msg) {
-    console.log(\`[\${new Date().toISOString()}] \${msg}\`);
-}
+function log(msg) { console.log(\`[\${new Date().toISOString()}] \${msg}\`); }
 
 const server = http.createServer((clientReq, clientRes) => {
     const reqId = Math.random().toString(36).substring(7);
     const mode = clientReq.headers['x-proxy-mode'];
 
-    // === 场景 A: WebSocket 手动握手 ===
+    // === 场景 A: WebSocket 手动握手 (使用合法 Key) ===
     if (mode === 'websocket') {
         log(\`[req:\${reqId}] MODE: WebSocket (Manual Handshake)\`);
-        
         const headscaleSocket = net.connect(TARGET_PORT, TARGET_HOST, () => {
-            // 使用 Worker 传来的 Key，或者使用一个合法的默认 Key (16字节 Base64)
-            // dGhlIHNhbXBsZSBub25jZQ== 解码为 "the sample nonce" (16 bytes)
+            // 【关键修复】使用合法的 16字节 Base64 Key
             const wsKey = clientReq.headers['x-ws-key'] || 'dGhlIHNhbXBsZSBub25jZQ==';
             const wsProto = clientReq.headers['x-ws-proto'];
 
@@ -60,30 +56,21 @@ const server = http.createServer((clientReq, clientRes) => {
 
             headscaleSocket.write(rawReq);
         });
-
-        headscaleSocket.on('data', (chunk) => {
-            clientReq.socket.write(chunk);
-        });
         
-        clientReq.socket.on('data', (chunk) => {
-            headscaleSocket.write(chunk);
-        });
-
-        headscaleSocket.on('end', () => clientReq.socket.end());
-        clientReq.socket.on('end', () => headscaleSocket.end());
+        // 管道对接
+        headscaleSocket.pipe(clientReq.socket);
+        clientReq.socket.pipe(headscaleSocket);
         
         headscaleSocket.on('error', (e) => {
              log(\`[req:\${reqId}] Socket Error: \${e.message}\`);
              clientReq.socket.end();
         });
-
-        return;
+        return; // 接管 Socket 后退出
     }
 
-    // === 场景 B: Base64 解码 ===
+    // === 场景 B: Base64 解码 (/machine/register) ===
     if (mode === 'base64') {
         log(\`[req:\${reqId}] MODE: Base64 Decode\`);
-        
         const options = {
             hostname: TARGET_HOST,
             port: TARGET_PORT,
@@ -91,10 +78,12 @@ const server = http.createServer((clientReq, clientRes) => {
             method: clientReq.method,
             headers: { ...clientReq.headers }
         };
+        // 清理干扰头
         delete options.headers['x-proxy-mode'];
         delete options.headers['x-ws-key'];
         delete options.headers['content-type'];
         delete options.headers['content-length'];
+        delete options.headers['host']; // 防止 Host 头干扰
 
         const proxyReq = http.request(options, (proxyRes) => {
             clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
@@ -117,7 +106,7 @@ const server = http.createServer((clientReq, clientRes) => {
         return;
     }
 
-    // === 场景 C: 普通透传 (含 HTTP 模式的 /ts2021) ===
+    // === 场景 C: 普通透传 (Legacy POST) ===
     log(\`[req:\${reqId}] MODE: Standard Proxy\`);
     const options = {
         hostname: TARGET_HOST,
@@ -126,8 +115,9 @@ const server = http.createServer((clientReq, clientRes) => {
         method: clientReq.method,
         headers: { ...clientReq.headers }
     };
+    // 【关键】清理 Host 头，防止 Headscale 拒绝
+    delete options.headers['host'];
     
-    // 即使是普通代理，也要确保流式传输顺畅
     const proxyReq = http.request(options, (proxyRes) => {
         clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
         proxyRes.pipe(clientRes, { end: true });
@@ -137,9 +127,7 @@ const server = http.createServer((clientReq, clientRes) => {
     clientReq.pipe(proxyReq, { end: true });
 });
 
-server.listen(8080, () => {
-    log('>>> Node.js Proxy (Correct Key Edition) ready on 8080');
-});
+server.listen(8080, () => { console.log('>>> Node.js Proxy Ready'); });
 EOF
 
 # 初始化数据库（如果是第一次运行）
