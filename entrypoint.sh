@@ -23,21 +23,35 @@ fi
 # 开启错误追踪，便于调试
 set -e
 
-
-# 1. 安装 Node.js (Alpine 环境)
-echo "Installing Node.js..."
-apk add --no-cache nodejs
-
-# 2. 生成 Base64 解壳代理脚本 (Node.js)
-# 逻辑：监听 8080，收到请求后，如果是 Base64 封装的，就解码并发给 8081
+# === 第一步：生成带详细调试信息的 Node.js 代理 (proxy.js) ===
 cat <<EOF > /proxy.js
 const http = require('http');
 
-const TARGET_PORT = 8081; // Headscale 端口
+// 目标：内部运行的 Headscale
+const TARGET_PORT = 8081;
 const TARGET_HOST = '127.0.0.1';
 
+// 简单的带时间戳日志工具
+function log(msg) {
+    console.log(\`[\${new Date().toISOString()}] \${msg}\`);
+}
+
 const server = http.createServer((clientReq, clientRes) => {
-    // 转发选项
+    const reqId = Math.random().toString(36).substring(7); // 给每个请求一个短ID方便追踪
+    
+    log(\`[req:\${reqId}] INCOMING > \${clientReq.method} \${clientReq.url}\`);
+    log(\`[req:\${reqId}] Headers > User-Agent: \${clientReq.headers['user-agent']}\`);
+
+    // 识别 Cloudflare Worker 加的特殊标记
+    const isEncapsulated = clientReq.headers['x-encapsulated'] === 'base64';
+    
+    // 调试日志：确认是否识别到封装
+    if (isEncapsulated) {
+        log(\`[req:\${reqId}] MODE: ENCAPSULATED (Detected x-encapsulated header)\`);
+    } else {
+        log(\`[req:\${reqId}] MODE: TRANSPARENT (Standard traffic)\`);
+    }
+
     const options = {
         hostname: TARGET_HOST,
         port: TARGET_PORT,
@@ -46,65 +60,70 @@ const server = http.createServer((clientReq, clientRes) => {
         headers: { ...clientReq.headers }
     };
 
-    // 识别是否是被 Worker 封装过的流量
-    const isEncapsulated = clientReq.headers['x-encapsulated'] === 'base64';
-
-    // 如果是封装流量，我们要去掉这个头，还原真实 Content-Length（虽然流式传输往往不准，但最好处理下）
     if (isEncapsulated) {
+        // 清理掉伪装头
         delete options.headers['x-encapsulated'];
-        delete options.headers['content-length']; // 让 Node 重新计算
+        delete options.headers['content-length']; 
+        // 强制修正 content-type，因为 Headscale 期待 binary/noise
+        // 但其实 Headscale 主要看 Body 内容，这里不改也行，以防万一
     }
 
-    // 向 Headscale 发起请求
     const proxyReq = http.request(options, (proxyRes) => {
-        clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
+        log(\`[req:\${reqId}] HEADSCALE RESP < Status: \${proxyRes.statusCode}\`);
         
-        // --- 响应处理 ---
-        // 如果请求是封装进来的，我们也把响应封装回去 (Base64)
-        // 但为了简单，Register 接口通常只有请求体敏感。
-        // 如果你需要双向封装，这里也需要 Pipe 转换。
-        // 目前为了解决 403，主要是“请求体”被墙。响应通常没事。
-        // 直接透传响应：
+        clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
         proxyRes.pipe(clientRes, { end: true });
     });
 
     proxyReq.on('error', (e) => {
-        console.error('Proxy Error:', e);
+        log(\`[req:\${reqId}] ERROR: Proxy connection to Headscale failed: \${e.message}\`);
         clientRes.writeHead(502);
-        clientRes.end();
+        clientRes.end('Proxy Error');
     });
 
-    // --- 请求体处理 (核心解壳逻辑) ---
+    // === 核心解壳逻辑 ===
     if (isEncapsulated) {
         let bodyData = '';
         clientReq.setEncoding('utf8');
         
+        // 1. 接收 Worker 发来的 Base64 文本
         clientReq.on('data', (chunk) => {
             bodyData += chunk;
         });
 
         clientReq.on('end', () => {
             try {
-                // 1. 拿到 Base64 字符串
-                // 2. 解码成 Buffer (二进制)
-                const decodedBuffer = Buffer.from(bodyData, 'base64');
-                // 3. 发送给 Headscale
-                proxyReq.write(decodedBuffer);
+                if (bodyData.length > 0) {
+                    log(\`[req:\${reqId}] BODY > Received Base64 length: \${bodyData.length}\`);
+                    
+                    // 2. 解码回二进制
+                    const decodedBuffer = Buffer.from(bodyData, 'base64');
+                    log(\`[req:\${reqId}] BODY > Decoded Binary length: \${decodedBuffer.length}\`);
+                    
+                    // 3. 发送给 Headscale
+                    proxyReq.write(decodedBuffer);
+                } else {
+                    log(\`[req:\${reqId}] BODY > Empty body received\`);
+                }
                 proxyReq.end();
+                log(\`[req:\${reqId}] FORWARD > Request sent to Headscale\`);
+                
             } catch (e) {
-                console.error('Decode Error:', e);
+                log(\`[req:\${reqId}] FATAL > Base64 decode error: \${e.message}\`);
                 clientRes.writeHead(400);
-                clientRes.end();
+                clientRes.end('Decode Error');
             }
         });
     } else {
-        // 普通流量（GET请求等），直接透传
+        // 普通流量 (GET /key 等) 直接透传
+        log(\`[req:\${reqId}] PIPE > Streaming standard traffic directly\`);
         clientReq.pipe(proxyReq, { end: true });
     }
 });
 
 server.listen(8080, () => {
-    console.log('Base64 Proxy running on port 8080, forwarding to 8081');
+    log('>>> Node.js Base64 Proxy ready on port 8080 -> Forwarding to 8081');
+    log('>>> Debug logging enabled');
 });
 EOF
 
