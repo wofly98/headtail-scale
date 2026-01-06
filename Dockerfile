@@ -2,10 +2,7 @@ FROM alpine:latest
 
 # 安装依赖
 RUN apk update && apk add --no-cache \
-    ca-certificates wget unzip sudo openssh curl bash jq
-
-# 安装基础依赖
-RUN apk add --no-cache ca-certificates curl iptables ip6tables jq
+    ca-certificates wget unzip curl bash jq nodejs 
 
 # Tailscale 最新版本 (2026年1月)
 ENV TS_VERSION=1.92.3

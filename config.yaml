@@ -1,6 +1,6 @@
 # Headscale 配置 - 生产优化版（修复 prefixes 和其他问题）
-server_url: ${HEADSCALE_SERVER_URL:-http://127.0.0.1:8080}  # 会被环境变量 HEADSCALE_SERVER_URL 覆盖
-listen_addr: 0.0.0.0:8080
+server_url: ${HEADSCALE_SERVER_URL:-http://127.0.0.1:8081}  # 会被环境变量 HEADSCALE_SERVER_URL 覆盖
+listen_addr: 0.0.0.0:8081
 grpc_listen_addr: 0.0.0.0:50443
 grpc_allow_insecure: true  # Koyeb TLS 终止后允许明文 gRPC
 

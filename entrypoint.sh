@@ -9,48 +9,105 @@ if [ -n "$KOYEB_PUBLIC_DOMAIN" ]; then
 elif [ -n "$HEADSCALE_SERVER_URL" ]; then
     log "使用环境变量 server_url: $HEADSCALE_SERVER_URL"
 else
-    export HEADSCALE_SERVER_URL="http://localhost:8080"
+    export HEADSCALE_SERVER_URL="http://localhost:8081"
     warn "未检测到公网域名，使用本地地址 (仅测试用)"
 fi
 
 if [ -n "$LOCAL_LOGIN_URL" ]; then
     log "使用环境变量 login_url: $LOCAL_LOGIN_URL"
 else
-    export LOCAL_LOGIN_URL="http://localhost:8080"
+    export LOCAL_LOGIN_URL="http://localhost:8081"
     warn "未检测到公网域名，使用本地地址 (仅测试用)"
 fi
 
 # 开启错误追踪，便于调试
 set -e
 
-# --- 第一步：配置 Headscale ---
-# 如果没有配置文件，创建一个基础的（或者你可以映射一个）
-if [ ! -f /etc/headscale/config.yaml ]; then
-    echo "正在生成基础 Headscale 配置..."
-    mkdir -p /etc/headscale
-    # 注意：这里需要根据 Koyeb 的环境变量动态修改 server_url
-    # 假设 Koyeb 提供了公开域名，通常我们需要手动设置一个环境变量 HEADSCALE_SERVER_URL
-    cat <<EOF > /etc/headscale/config.yaml
-server_url: ${HEADSCALE_SERVER_URL:-http://127.0.0.1:8080}
-listen_addr: 0.0.0.0:8080
-metrics_listen_addr: 127.0.0.1:9090
-grpc_listen_addr: 0.0.0.0:50443
-grpc_allow_insecure: false
-private_key_path: /var/lib/headscale/private.key
-noise:
-  private_key_path: /var/lib/headscale/noise_private.key
-ip_prefixes:
-  - fd7a:115c:a1e0::/48
-  - 100.64.0.0/10
-database:
-  type: sqlite3
-  sqlite:
-    path: /var/lib/headscale/db.sqlite
-dns_config:
-  nameservers:
-    - 1.1.1.1
+
+# 1. 安装 Node.js (Alpine 环境)
+echo "Installing Node.js..."
+apk add --no-cache nodejs
+
+# 2. 生成 Base64 解壳代理脚本 (Node.js)
+# 逻辑：监听 8080，收到请求后，如果是 Base64 封装的，就解码并发给 8081
+cat <<EOF > /proxy.js
+const http = require('http');
+
+const TARGET_PORT = 8081; // Headscale 端口
+const TARGET_HOST = '127.0.0.1';
+
+const server = http.createServer((clientReq, clientRes) => {
+    // 转发选项
+    const options = {
+        hostname: TARGET_HOST,
+        port: TARGET_PORT,
+        path: clientReq.url,
+        method: clientReq.method,
+        headers: { ...clientReq.headers }
+    };
+
+    // 识别是否是被 Worker 封装过的流量
+    const isEncapsulated = clientReq.headers['x-encapsulated'] === 'base64';
+
+    // 如果是封装流量，我们要去掉这个头，还原真实 Content-Length（虽然流式传输往往不准，但最好处理下）
+    if (isEncapsulated) {
+        delete options.headers['x-encapsulated'];
+        delete options.headers['content-length']; // 让 Node 重新计算
+    }
+
+    // 向 Headscale 发起请求
+    const proxyReq = http.request(options, (proxyRes) => {
+        clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
+        
+        // --- 响应处理 ---
+        // 如果请求是封装进来的，我们也把响应封装回去 (Base64)
+        // 但为了简单，Register 接口通常只有请求体敏感。
+        // 如果你需要双向封装，这里也需要 Pipe 转换。
+        // 目前为了解决 403，主要是“请求体”被墙。响应通常没事。
+        // 直接透传响应：
+        proxyRes.pipe(clientRes, { end: true });
+    });
+
+    proxyReq.on('error', (e) => {
+        console.error('Proxy Error:', e);
+        clientRes.writeHead(502);
+        clientRes.end();
+    });
+
+    // --- 请求体处理 (核心解壳逻辑) ---
+    if (isEncapsulated) {
+        let bodyData = '';
+        clientReq.setEncoding('utf8');
+        
+        clientReq.on('data', (chunk) => {
+            bodyData += chunk;
+        });
+
+        clientReq.on('end', () => {
+            try {
+                // 1. 拿到 Base64 字符串
+                // 2. 解码成 Buffer (二进制)
+                const decodedBuffer = Buffer.from(bodyData, 'base64');
+                // 3. 发送给 Headscale
+                proxyReq.write(decodedBuffer);
+                proxyReq.end();
+            } catch (e) {
+                console.error('Decode Error:', e);
+                clientRes.writeHead(400);
+                clientRes.end();
+            }
+        });
+    } else {
+        // 普通流量（GET请求等），直接透传
+        clientReq.pipe(proxyReq, { end: true });
+    }
+});
+
+server.listen(8080, () => {
+    console.log('Base64 Proxy running on port 8080, forwarding to 8081');
+});
 EOF
-fi
+
 
 # 初始化数据库（如果是第一次运行）
 touch /var/lib/headscale/db.sqlite
@@ -62,7 +119,7 @@ HEADSCALE_PID=$!
 
 # --- 第二步：等待 Headscale 就绪 ---
 echo "等待 Headscale 启动..."
-until curl -s http://127.0.0.1:8080/health > /dev/null; do
+until curl -s http://127.0.0.1:8081/health > /dev/null; do
     sleep 1
     echo "..."
 done
@@ -144,4 +201,6 @@ echo "Tailscale 已连接！服务运行中..."
 
 # === 步骤 6: 保持容器运行 ===
 echo "系统: 所有服务已启动，进入守护模式..."
-wait $HEADSCALE_PID
+echo "Starting Node.js Proxy..."
+node /proxy.js
+#wait $HEADSCALE_PID
