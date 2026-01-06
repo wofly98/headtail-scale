@@ -23,7 +23,7 @@ fi
 # 开启错误追踪，便于调试
 set -e
 
-# === 生成“全协议兼容”版代理 (proxy.js) ===
+# === 生成“强制GET”版代理 (proxy.js) ===
 cat <<EOF > /proxy.js
 const http = require('http');
 const net = require('net');
@@ -37,32 +37,27 @@ const server = http.createServer((clientReq, clientRes) => {
     const reqId = Math.random().toString(36).substring(7);
     const mode = clientReq.headers['x-proxy-mode'];
 
-    // === 场景 A: 任意协议升级 (WebSocket 或 Tailscale) ===
+    // === 场景 A: 协议升级 (WebSocket 或 Tailscale) ===
     if (mode === 'upgrade') {
         const upgradeProto = clientReq.headers['x-upgrade-proto'] || 'websocket';
         log(\`[req:\${reqId}] MODE: Manual Upgrade (\${upgradeProto})\`);
         
         const headscaleSocket = net.connect(TARGET_PORT, TARGET_HOST, () => {
-            // 构造原始请求行
-            // Tailscale Control Protocol 使用 POST，标准 WebSocket 使用 GET
-            // 我们尽量保留原始 Method，但通常 Upgrade 都是 GET，除非是 Tailscale
-            const method = clientReq.method; 
-            let rawReq = \`\${method} /ts2021 HTTP/1.1\r\n\`;
+            // 【核心修复】强制使用 GET 方法！
+            // 即使客户端发的是 POST，协议升级握手也必须是 GET，否则 Headscale 会拒绝
+            let rawReq = \`GET /ts2021 HTTP/1.1\r\n\`;
             
             rawReq += \`Host: 127.0.0.1:\${TARGET_PORT}\r\n\`;
             rawReq += \`Connection: Upgrade\r\n\`;
             rawReq += \`Upgrade: \${upgradeProto}\r\n\`;
 
-            // 【核心修复】遍历并写入所有重要 Header
-            // 特别是 X-Tailscale-Handshake，绝对不能丢！
+            // 转发关键头，但排除 Content-Length (因为 GET 没有 Body)
             const headersToForward = [
                 'sec-websocket-key',
                 'sec-websocket-protocol',
                 'sec-websocket-version',
-                'x-tailscale-handshake', // <--- 之前死就死在这里没传
-                'authorization',
-                'content-type',
-                'content-length' // 虽然 Upgrade 通常无 Body，但 Tailscale 可能有
+                'x-tailscale-handshake', // 这是 Tailscale 协议的核心
+                'authorization'
             ];
 
             headersToForward.forEach(key => {
@@ -141,7 +136,6 @@ const server = http.createServer((clientReq, clientRes) => {
     };
     delete options.headers['host'];
     
-    // 如果是 Legacy POST，使用 pipe 转发流
     const proxyReq = http.request(options, (proxyRes) => {
         clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
         proxyRes.pipe(clientRes, { end: true });
@@ -150,7 +144,7 @@ const server = http.createServer((clientReq, clientRes) => {
     clientReq.pipe(proxyReq, { end: true });
 });
 
-server.listen(8080, () => { console.log('>>> Node.js Proxy (Universal) Ready'); });
+server.listen(8080, () => { console.log('>>> Node.js Proxy (Force GET) Ready'); });
 EOF
 
 # 初始化数据库（如果是第一次运行）
