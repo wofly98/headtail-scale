@@ -41,13 +41,8 @@ policy:
 
 # DERP 配置 (使用官方 DERP)
 derp:
-  server:
-    enabled: false
-  urls: [] # 留空，不让它去下载
-  paths:
-    - /etc/headscale/derp.yaml # 我们可以手动提供一个本地文件
-  auto_update_enabled: false # <--- 关键：关掉它！防止服务端卡住
-  update_frequency: 24h
+  urls:
+    - https://controlplane.tailscale.com/derpmap/default
 
 # TLS 配置 - 关闭内置TLS，让 Koyeb 处理
 tls:
