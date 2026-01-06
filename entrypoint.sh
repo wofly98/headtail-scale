@@ -23,7 +23,7 @@ fi
 # 开启错误追踪，便于调试
 set -e
 
-# === 生成“强制GET”版代理 (proxy.js) ===
+# === 生成“全透明调试”版代理 (proxy.js) ===
 cat <<EOF > /proxy.js
 const http = require('http');
 const net = require('net');
@@ -37,27 +37,31 @@ const server = http.createServer((clientReq, clientRes) => {
     const reqId = Math.random().toString(36).substring(7);
     const mode = clientReq.headers['x-proxy-mode'];
 
+    // 1. 打印 Worker 发来的原始请求头，看看丢了没
+    log(\`[req:\${reqId}] INCOMING HEADERS:\n\${JSON.stringify(clientReq.headers, null, 2)}\`);
+
     // === 场景 A: 协议升级 (WebSocket 或 Tailscale) ===
     if (mode === 'upgrade') {
         const upgradeProto = clientReq.headers['x-upgrade-proto'] || 'websocket';
         log(\`[req:\${reqId}] MODE: Manual Upgrade (\${upgradeProto})\`);
         
         const headscaleSocket = net.connect(TARGET_PORT, TARGET_HOST, () => {
-            // 【核心修复】强制使用 GET 方法！
-            // 即使客户端发的是 POST，协议升级握手也必须是 GET，否则 Headscale 会拒绝
+            // 构造请求 (强制 GET)
             let rawReq = \`GET /ts2021 HTTP/1.1\r\n\`;
-            
             rawReq += \`Host: 127.0.0.1:\${TARGET_PORT}\r\n\`;
             rawReq += \`Connection: Upgrade\r\n\`;
             rawReq += \`Upgrade: \${upgradeProto}\r\n\`;
 
-            // 转发关键头，但排除 Content-Length (因为 GET 没有 Body)
+            // 转发列表：把能想到的都加上，宁多勿少
             const headersToForward = [
                 'sec-websocket-key',
                 'sec-websocket-protocol',
                 'sec-websocket-version',
-                'x-tailscale-handshake', // 这是 Tailscale 协议的核心
-                'authorization'
+                'x-tailscale-handshake', 
+                'authorization',
+                'user-agent',       // <--- 新增：防止因缺少 UA 被拒绝
+                'accept-encoding',
+                'accept-language'
             ];
 
             headersToForward.forEach(key => {
@@ -66,24 +70,45 @@ const server = http.createServer((clientReq, clientRes) => {
                 }
             });
 
-            // 补全 WebSocket Key (如果是 websocket 协议但没 Key)
+            // 补全 WebSocket Key
             if (upgradeProto === 'websocket' && !clientReq.headers['sec-websocket-key']) {
                  rawReq += \`Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\`;
             }
 
-            rawReq += \`\r\n\`; // Header 结束
+            rawReq += \`\r\n\`; 
+            
+            // 2. 打印我们将要发送给 Headscale 的原始报文
+            log(\`[req:\${reqId}] >>> OUTGOING RAW REQUEST:\n\${rawReq}\`);
 
             headscaleSocket.write(rawReq);
         });
         
-        // 管道对接
-        headscaleSocket.pipe(clientReq.socket);
-        clientReq.socket.pipe(headscaleSocket);
+        // 3. 监听 Headscale 的响应 (打印前 1024 字节)
+        let isFirstChunk = true;
+        headscaleSocket.on('data', (chunk) => {
+            if (isFirstChunk) {
+                const respStr = chunk.toString();
+                log(\`[req:\${reqId}] <<< INCOMING HEADSCALE RESPONSE:\n\${respStr.substring(0, 1024)}\`);
+                isFirstChunk = false;
+            }
+            clientReq.socket.write(chunk);
+        });
+
+        // 双向管道
+        clientReq.socket.on('data', (chunk) => {
+            headscaleSocket.write(chunk);
+        });
         
+        headscaleSocket.on('end', () => log(\`[req:\${reqId}] Headscale closed connection\`));
         headscaleSocket.on('error', (e) => {
-             log(\`[req:\${reqId}] Socket Error: \${e.message}\`);
+             log(\`[req:\${reqId}] Headscale Socket Error: \${e.message}\`);
              clientReq.socket.end();
         });
+        clientReq.socket.on('error', (e) => {
+            log(\`[req:\${reqId}] Client Socket Error: \${e.message}\`);
+            headscaleSocket.end();
+        });
+
         return; 
     }
 
@@ -105,6 +130,7 @@ const server = http.createServer((clientReq, clientRes) => {
         delete options.headers['host'];
 
         const proxyReq = http.request(options, (proxyRes) => {
+            log(\`[req:\${reqId}] Register Response: \${proxyRes.statusCode}\`);
             clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
             proxyRes.pipe(clientRes, { end: true });
         });
@@ -117,7 +143,9 @@ const server = http.createServer((clientReq, clientRes) => {
                 const decodedBuffer = Buffer.from(bodyData, 'base64');
                 proxyReq.write(decodedBuffer);
                 proxyReq.end();
+                log(\`[req:\${reqId}] Sent Base64 Body (\${decodedBuffer.length} bytes)\`);
             } catch (e) {
+                log(\`[req:\${reqId}] Base64 Decode Error\`);
                 clientRes.writeHead(400);
                 clientRes.end();
             }
@@ -137,14 +165,20 @@ const server = http.createServer((clientReq, clientRes) => {
     delete options.headers['host'];
     
     const proxyReq = http.request(options, (proxyRes) => {
+        log(\`[req:\${reqId}] Standard Response: \${proxyRes.statusCode}\`);
         clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
         proxyRes.pipe(clientRes, { end: true });
     });
     
+    // 捕获请求错误
+    proxyReq.on('error', (e) => {
+        log(\`[req:\${reqId}] Proxy Request Error: \${e.message}\`);
+    });
+
     clientReq.pipe(proxyReq, { end: true });
 });
 
-server.listen(8080, () => { console.log('>>> Node.js Proxy (Force GET) Ready'); });
+server.listen(8080, () => { console.log('>>> Node.js DEBUG Proxy Ready'); });
 EOF
 
 # 初始化数据库（如果是第一次运行）
