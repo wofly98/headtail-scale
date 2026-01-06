@@ -23,7 +23,7 @@ fi
 # 开启错误追踪，便于调试
 set -e
 
-# === 生成全封装还原代理 (proxy.js) ===
+# === 生成指令执行版代理 (proxy.js) ===
 cat <<EOF > /proxy.js
 const http = require('http');
 const net = require('net');
@@ -37,114 +37,117 @@ function log(msg) {
 
 const server = http.createServer((clientReq, clientRes) => {
     const reqId = Math.random().toString(36).substring(7);
+    const mode = clientReq.headers['x-proxy-mode'];
 
-    // 1. 解包元数据 (还原原始 Header)
-    let realHeaders = {};
-    try {
-        if (clientReq.headers['x-hidden-meta']) {
-            realHeaders = JSON.parse(clientReq.headers['x-hidden-meta']);
-        } else {
-            // 如果没有封装头，说明是直连或异常，尝试使用现有头
-            realHeaders = { ...clientReq.headers };
-        }
-    } catch (e) {
-        log(\`[req:\${reqId}] Failed to parse hidden meta\`);
-        realHeaders = { ...clientReq.headers };
-    }
-
-    const isWebSocket = realHeaders['upgrade'] === 'websocket';
-    const isBase64Body = clientReq.headers['x-body-encoding'] === 'base64';
-
-    // === 场景 A: 还原 WebSocket 握手 (/ts2021) ===
-    if (isWebSocket) {
-        log(\`[req:\${reqId}] TYPE: WebSocket (Restored from Meta)\`);
+    // === 场景 A: WebSocket 强行握手 (/ts2021) ===
+    if (mode === 'websocket') {
+        log(\`[req:\${reqId}] MODE: WebSocket (Manual Handshake)\`);
         
-        // 使用 Net 模块直接建立 TCP 连接，绕过 HTTP 协议限制
-        const proxySocket = net.connect(TARGET_PORT, TARGET_HOST, () => {
-            // 手动构建 HTTP 报文 (因为 Node http 模块不支持在非 Upgrade 请求里发起 Upgrade)
-            let rawReq = \`\${clientReq.method} \${clientReq.url} HTTP/1.1\r\n\`;
-            
-            // 写入还原后的 Header
-            Object.keys(realHeaders).forEach(key => {
-                // 排除掉可能冲突的头，Host 强制修正
-                if (key !== 'host') {
-                    rawReq += \`\${key}: \${realHeaders[key]}\r\n\`;
-                }
-            });
+        // 1. 建立到 Headscale 的纯 TCP 连接
+        const headscaleSocket = net.connect(TARGET_PORT, TARGET_HOST, () => {
+            // 2. 获取 Worker 传来的 Key
+            const wsKey = clientReq.headers['x-ws-key'] || 'SGVsbG8sIHdvcmxkIQ==';
+            const wsProto = clientReq.headers['x-ws-proto'];
+
+            // 3. 手动构造 HTTP 1.1 Upgrade 报文
+            // 这是一个标准的 WebSocket 握手包，Headscale 看到这个一定会回 101
+            let rawReq = \`GET /ts2021 HTTP/1.1\r\n\`;
             rawReq += \`Host: 127.0.0.1:\${TARGET_PORT}\r\n\`;
-            rawReq += '\r\n'; // 头部结束
+            rawReq += \`Connection: Upgrade\r\n\`;
+            rawReq += \`Upgrade: websocket\r\n\`;
+            rawReq += \`Sec-WebSocket-Version: 13\r\n\`;
+            rawReq += \`Sec-WebSocket-Key: \${wsKey}\r\n\`;
+            if (wsProto) rawReq += \`Sec-WebSocket-Protocol: \${wsProto}\r\n\`;
+            rawReq += \`\r\n\`; // 结束空行
 
-            proxySocket.write(rawReq);
+            // 4. 发送握手包
+            headscaleSocket.write(rawReq);
         });
 
-        // 管道对接：Headscale <-> Koyeb/Worker
-        proxySocket.pipe(clientRes.socket || clientRes);
-        clientReq.pipe(proxySocket);
-
-        proxySocket.on('error', (e) => {
-            log(\`[req:\${reqId}] WS Socket Error: \${e.message}\`);
-            clientRes.end();
+        // 5. 管道对接：Headscale <-> Koyeb/Worker
+        // 只要 Headscale 回复数据（101响应），直接透传给客户端
+        // 我们直接操作底层 socket，不再管 clientRes 对象
+        
+        headscaleSocket.on('data', (chunk) => {
+            clientReq.socket.write(chunk);
         });
         
-        // 这里的 return 非常关键，接管 socket 后退出 http 处理流程
-        return; 
+        headscaleSocket.on('end', () => {
+            clientReq.socket.end();
+        });
+
+        headscaleSocket.on('error', (e) => {
+            log(\`[req:\${reqId}] HS Socket Error: \${e.message}\`);
+            clientReq.socket.end();
+        });
+
+        // 客户端发来的后续数据（握手后的加密包） -> Headscale
+        clientReq.socket.on('data', (chunk) => {
+            headscaleSocket.write(chunk);
+        });
+        
+        // 这一步告诉 http server：我已经接管 socket 了，你别管了
+        return;
     }
 
-    // === 场景 B: 还原普通 HTTP 请求 (Register / Key) ===
-    log(\`[req:\${reqId}] TYPE: Standard HTTP\`);
-    
-    const options = {
-        hostname: TARGET_HOST,
-        port: TARGET_PORT,
-        path: clientReq.url,
-        method: clientReq.method,
-        headers: realHeaders // 使用还原后的 Header
-    };
+    // === 场景 B: Base64 解码 (/machine/register) ===
+    if (mode === 'base64') {
+        log(\`[req:\${reqId}] MODE: Base64 Decode\`);
+        
+        // 构造发给 Headscale 的请求
+        const options = {
+            hostname: TARGET_HOST,
+            port: TARGET_PORT,
+            path: clientReq.url,
+            method: clientReq.method,
+            headers: { ...clientReq.headers }
+        };
+        // 清理干扰头
+        delete options.headers['x-proxy-mode'];
+        delete options.headers['content-type'];
+        delete options.headers['content-length'];
 
-    // 清理掉 node 自动加的 connection 头，防止 conflict
-    delete options.headers['connection'];
-    delete options.headers['host'];
-    // 重新计算 content-length (因为 Base64 解码后长度变了)
-    delete options.headers['content-length'];
+        const proxyReq = http.request(options, (proxyRes) => {
+            clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
+            proxyRes.pipe(clientRes, { end: true });
+        });
 
-    const proxyReq = http.request(options, (proxyRes) => {
-        clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
-        proxyRes.pipe(clientRes, { end: true });
-    });
-
-    proxyReq.on('error', (e) => {
-        log(\`[req:\${reqId}] Proxy Error: \${e.message}\`);
-        clientRes.writeHead(502);
-        clientRes.end();
-    });
-
-    // === Body 处理：解码 Base64 并转发 ===
-    if (isBase64Body) {
         let bodyData = '';
         clientReq.setEncoding('utf8');
         clientReq.on('data', chunk => bodyData += chunk);
         clientReq.on('end', () => {
             try {
-                if (bodyData.length > 0) {
-                    const decodedBuffer = Buffer.from(bodyData, 'base64');
-                    proxyReq.write(decodedBuffer);
-                    log(\`[req:\${reqId}] Decoded Body: \${decodedBuffer.length} bytes\`);
-                }
+                const decodedBuffer = Buffer.from(bodyData, 'base64');
+                proxyReq.write(decodedBuffer);
                 proxyReq.end();
+                log(\`[req:\${reqId}] Forwarded \${decodedBuffer.length} bytes\`);
             } catch (e) {
                 log(\`[req:\${reqId}] Decode Error\`);
                 clientRes.writeHead(400);
                 clientRes.end();
             }
         });
-    } else {
-        // 如果 Worker 没有 Base64 编码（比如 GET 请求），直接透传
-        clientReq.pipe(proxyReq, { end: true });
+        return;
     }
+
+    // === 场景 C: 普通透传 (GET /key) ===
+    log(\`[req:\${reqId}] MODE: Standard Proxy\`);
+    const options = {
+        hostname: TARGET_HOST,
+        port: TARGET_PORT,
+        path: clientReq.url,
+        method: clientReq.method,
+        headers: { ...clientReq.headers }
+    };
+    const proxyReq = http.request(options, (proxyRes) => {
+        clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
+        proxyRes.pipe(clientRes, { end: true });
+    });
+    clientReq.pipe(proxyReq, { end: true });
 });
 
 server.listen(8080, () => {
-    log('>>> Universal Unpacker Proxy ready on 8080');
+    log('>>> Node.js Proxy (Direct-TCP Mode) ready on 8080');
 });
 EOF
 
