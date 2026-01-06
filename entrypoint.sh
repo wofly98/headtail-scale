@@ -23,34 +23,23 @@ fi
 # 开启错误追踪，便于调试
 set -e
 
-# === 第一步：生成带详细调试信息的 Node.js 代理 (proxy.js) ===
+# === 生成支持 WebSocket 的 Node.js 代理 (proxy.js) ===
 cat <<EOF > /proxy.js
 const http = require('http');
+const net = require('net'); // 引入 net 模块处理 TCP 管道
 
-// 目标：内部运行的 Headscale
 const TARGET_PORT = 8081;
 const TARGET_HOST = '127.0.0.1';
 
-// 简单的带时间戳日志工具
 function log(msg) {
     console.log(\`[\${new Date().toISOString()}] \${msg}\`);
 }
 
 const server = http.createServer((clientReq, clientRes) => {
-    const reqId = Math.random().toString(36).substring(7); // 给每个请求一个短ID方便追踪
+    const reqId = Math.random().toString(36).substring(7);
     
-    log(\`[req:\${reqId}] INCOMING > \${clientReq.method} \${clientReq.url}\`);
-    log(\`[req:\${reqId}] Headers > User-Agent: \${clientReq.headers['user-agent']}\`);
-
     // 识别 Cloudflare Worker 加的特殊标记
     const isEncapsulated = clientReq.headers['x-encapsulated'] === 'base64';
-    
-    // 调试日志：确认是否识别到封装
-    if (isEncapsulated) {
-        log(\`[req:\${reqId}] MODE: ENCAPSULATED (Detected x-encapsulated header)\`);
-    } else {
-        log(\`[req:\${reqId}] MODE: TRANSPARENT (Standard traffic)\`);
-    }
 
     const options = {
         hostname: TARGET_HOST,
@@ -61,69 +50,71 @@ const server = http.createServer((clientReq, clientRes) => {
     };
 
     if (isEncapsulated) {
-        // 清理掉伪装头
+        log(\`[req:\${reqId}] MODE: ENCAPSULATED > \${clientReq.url}\`);
         delete options.headers['x-encapsulated'];
         delete options.headers['content-length']; 
-        // 强制修正 content-type，因为 Headscale 期待 binary/noise
-        // 但其实 Headscale 主要看 Body 内容，这里不改也行，以防万一
+    } else {
+        log(\`[req:\${reqId}] MODE: TRANSPARENT > \${clientReq.url}\`);
     }
 
     const proxyReq = http.request(options, (proxyRes) => {
-        log(\`[req:\${reqId}] HEADSCALE RESP < Status: \${proxyRes.statusCode}\`);
-        
         clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
         proxyRes.pipe(clientRes, { end: true });
     });
 
     proxyReq.on('error', (e) => {
-        log(\`[req:\${reqId}] ERROR: Proxy connection to Headscale failed: \${e.message}\`);
+        log(\`[req:\${reqId}] ERROR: \${e.message}\`);
         clientRes.writeHead(502);
-        clientRes.end('Proxy Error');
+        clientRes.end();
     });
 
-    // === 核心解壳逻辑 ===
     if (isEncapsulated) {
         let bodyData = '';
         clientReq.setEncoding('utf8');
-        
-        // 1. 接收 Worker 发来的 Base64 文本
-        clientReq.on('data', (chunk) => {
-            bodyData += chunk;
-        });
-
+        clientReq.on('data', chunk => bodyData += chunk);
         clientReq.on('end', () => {
             try {
                 if (bodyData.length > 0) {
-                    log(\`[req:\${reqId}] BODY > Received Base64 length: \${bodyData.length}\`);
-                    
-                    // 2. 解码回二进制
                     const decodedBuffer = Buffer.from(bodyData, 'base64');
-                    log(\`[req:\${reqId}] BODY > Decoded Binary length: \${decodedBuffer.length}\`);
-                    
-                    // 3. 发送给 Headscale
                     proxyReq.write(decodedBuffer);
-                } else {
-                    log(\`[req:\${reqId}] BODY > Empty body received\`);
                 }
                 proxyReq.end();
-                log(\`[req:\${reqId}] FORWARD > Request sent to Headscale\`);
-                
             } catch (e) {
-                log(\`[req:\${reqId}] FATAL > Base64 decode error: \${e.message}\`);
                 clientRes.writeHead(400);
-                clientRes.end('Decode Error');
+                clientRes.end();
             }
         });
     } else {
-        // 普通流量 (GET /key 等) 直接透传
-        log(\`[req:\${reqId}] PIPE > Streaming standard traffic directly\`);
         clientReq.pipe(proxyReq, { end: true });
     }
 });
 
+// === 【关键新增】处理 WebSocket Upgrade 请求 (/ts2021) ===
+server.on('upgrade', (req, socket, head) => {
+    log(\`[WS] Upgrade request for \${req.url}\`);
+    
+    const proxySocket = net.connect(TARGET_PORT, TARGET_HOST, () => {
+        // 手动构造 HTTP Upgrade 请求头发送给 Headscale
+        proxySocket.write(\`\${req.method} \${req.url} HTTP/1.1\r\n\`);
+        for (let i = 0; i < req.rawHeaders.length; i += 2) {
+            proxySocket.write(\`\${req.rawHeaders[i]}: \${req.rawHeaders[i+1]}\r\n\`);
+        }
+        proxySocket.write('\r\n');
+        proxySocket.write(head);
+        
+        // 建立管道
+        proxySocket.pipe(socket);
+        socket.pipe(proxySocket);
+    });
+
+    proxySocket.on('error', (e) => {
+        log(\`[WS] Error: \${e.message}\`);
+        socket.end();
+    });
+});
+
 server.listen(8080, () => {
-    log('>>> Node.js Base64 Proxy ready on port 8080 -> Forwarding to 8081');
-    log('>>> Debug logging enabled');
+    log('>>> Node.js Proxy (HTTP + WebSocket) ready on 8080');
 });
 EOF
 
