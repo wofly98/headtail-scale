@@ -13,6 +13,13 @@ else
     warn "未检测到公网域名，使用本地地址 (仅测试用)"
 fi
 
+if [ -n "$LOCAL_LOGIN_URL" ]; then
+    log "使用环境变量 login_url: $LOCAL_LOGIN_URL"
+else
+    export LOCAL_LOGIN_URL="http://localhost:8080"
+    warn "未检测到公网域名，使用本地地址 (仅测试用)"
+fi
+
 # 开启错误追踪，便于调试
 set -e
 
@@ -101,7 +108,7 @@ echo "执行 Tailscale Up..."
 # 这里我们要连接的是 localhost 的 headscale，因为它们在同一个容器里
 # 但要注意：login-server 必须填 Headscale 配置文件里 server_url 的地址
 # 如果 server_url 是公网域名，这里最好也填公网域名，或者通过 hosts 欺骗
-tailscale up --login-server=${HEADSCALE_SERVER_URL:-http://127.0.0.1:8080} --authkey=$AUTHKEY --hostname=$TS_HOSTNAME --advertise-exit-node=true
+tailscale up --login-server=$LOCAL_LOGIN_URL --authkey=$AUTHKEY --hostname=$TS_HOSTNAME --advertise-exit-node=true
 
 echo "Tailscale 已连接！服务运行中..."
 
