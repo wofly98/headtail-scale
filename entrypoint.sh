@@ -23,7 +23,7 @@ fi
 # 开启错误追踪，便于调试
 set -e
 
-# === 生成“显微镜”调试代理 (proxy.js) ===
+# === 生成“手动强制升级”版代理 (proxy.js) ===
 cat <<EOF > /proxy.js
 const http = require('http');
 const net = require('net');
@@ -31,20 +31,111 @@ const net = require('net');
 const TARGET_PORT = 8081;
 const TARGET_HOST = '127.0.0.1';
 
-function log(tag, msg, data) {
-    const time = new Date().toISOString();
-    if (data) {
-        console.log(\`[\${time}] [\${tag}] \${msg}\n\${JSON.stringify(data, null, 2)}\`);
-    } else {
-        console.log(\`[\${time}] [\${tag}] \${msg}\`);
-    }
+function log(msg) {
+    console.log(\`[\${new Date().toISOString()}] \${msg}\`);
 }
 
 const server = http.createServer((clientReq, clientRes) => {
-    // 1. 打印 HTTP 请求的所有细节
-    log('HTTP_REQ', \`Received \${clientReq.method} \${clientReq.url}\`, clientReq.headers);
+    const reqId = Math.random().toString(36).substring(7);
+    const mode = clientReq.headers['x-proxy-mode'];
 
-    // 简单透传逻辑，保持请求不断开，以便观察 Headscale 的反应
+    // === 场景 A: 伪装成 HTTP 的 WebSocket 请求 ===
+    // 只要看到 x-proxy-mode: websocket，不管它是不是 GET/POST，不管有没有 Upgrade 头
+    // 我们都强行把它转换成标准的 WebSocket 握手发给 Headscale
+    if (mode === 'websocket') {
+        log(\`[req:\${reqId}] DETECTED FAKE WEBSOCKET > Initiating Manual Handshake\`);
+
+        // 1. 直接建立 TCP 连接 (绕过 Node HTTP 模块)
+        const headscaleSocket = net.connect(TARGET_PORT, TARGET_HOST, () => {
+            // 2. 提取 Key (Worker 传过来的)
+            const wsKey = clientReq.headers['x-ws-key'] || 'SGVsbG8sIHdvcmxkIQ==';
+            const wsProto = clientReq.headers['x-ws-proto'];
+
+            // 3. 手动构造 Headscale 能看懂的标准握手包
+            // 注意：WebSocket 握手必须是 GET 方法，即使客户端发来的是 POST
+            let rawReq = \`GET /ts2021 HTTP/1.1\r\n\`; 
+            rawReq += \`Host: 127.0.0.1:\${TARGET_PORT}\r\n\`;
+            rawReq += \`Connection: Upgrade\r\n\`;
+            rawReq += \`Upgrade: websocket\r\n\`;
+            rawReq += \`Sec-WebSocket-Version: 13\r\n\`;
+            rawReq += \`Sec-WebSocket-Key: \${wsKey}\r\n\`;
+            if (wsProto) rawReq += \`Sec-WebSocket-Protocol: \${wsProto}\r\n\`;
+            rawReq += \`\r\n\`; // 头部结束
+
+            // 4. 发送给 Headscale
+            headscaleSocket.write(rawReq);
+        });
+
+        // 5. 管道对接：Headscale <-> 客户端
+        
+        // 当 Headscale 返回数据 (101 Switching Protocols) 时，直接写回给客户端 Socket
+        headscaleSocket.on('data', (chunk) => {
+            clientReq.socket.write(chunk);
+        });
+        
+        // 客户端发来的后续加密数据 -> Headscale
+        clientReq.socket.on('data', (chunk) => {
+            headscaleSocket.write(chunk);
+        });
+
+        // 错误处理
+        headscaleSocket.on('error', (e) => {
+            log(\`[req:\${reqId}] HS Socket Error: \${e.message}\`);
+            clientReq.socket.end();
+        });
+        clientReq.socket.on('error', (e) => {
+            log(\`[req:\${reqId}] Client Socket Error: \${e.message}\`);
+            headscaleSocket.end();
+        });
+        
+        headscaleSocket.on('end', () => clientReq.socket.end());
+        clientReq.socket.on('end', () => headscaleSocket.end());
+
+        // 退出 HTTP 处理流程，接管 Socket
+        return;
+    }
+
+    // === 场景 B: Base64 解码 (/machine/register) ===
+    if (mode === 'base64') {
+        log(\`[req:\${reqId}] MODE: Base64 Decode\`);
+        
+        const options = {
+            hostname: TARGET_HOST,
+            port: TARGET_PORT,
+            path: clientReq.url,
+            method: clientReq.method,
+            headers: { ...clientReq.headers }
+        };
+        // 清理干扰头
+        delete options.headers['x-proxy-mode'];
+        delete options.headers['content-type'];
+        delete options.headers['content-length'];
+
+        const proxyReq = http.request(options, (proxyRes) => {
+            clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
+            proxyRes.pipe(clientRes, { end: true });
+        });
+
+        let bodyData = '';
+        clientReq.setEncoding('utf8');
+        clientReq.on('data', chunk => bodyData += chunk);
+        clientReq.on('end', () => {
+            try {
+                const decodedBuffer = Buffer.from(bodyData, 'base64');
+                proxyReq.write(decodedBuffer);
+                proxyReq.end();
+                log(\`[req:\${reqId}] Forwarded \${decodedBuffer.length} bytes (Base64)\`);
+            } catch (e) {
+                log(\`[req:\${reqId}] Decode Error\`);
+                clientRes.writeHead(400);
+                clientRes.end();
+            }
+        });
+        return;
+    }
+
+    // === 场景 C: 普通透传 (GET /key) ===
+    // log(\`[req:\${reqId}] MODE: Standard Proxy\`);
     const options = {
         hostname: TARGET_HOST,
         port: TARGET_PORT,
@@ -52,46 +143,15 @@ const server = http.createServer((clientReq, clientRes) => {
         method: clientReq.method,
         headers: { ...clientReq.headers }
     };
-
     const proxyReq = http.request(options, (proxyRes) => {
-        log('HTTP_RES', \`Headscale responded with \${proxyRes.statusCode}\`);
         clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
         proxyRes.pipe(clientRes, { end: true });
     });
-
-    proxyReq.on('error', (e) => {
-        log('HTTP_ERR', \`Proxy Error: \${e.message}\`);
-        clientRes.end();
-    });
-
     clientReq.pipe(proxyReq, { end: true });
 });
 
-// 2. 打印 Upgrade (WebSocket) 请求的所有细节
-server.on('upgrade', (req, socket, head) => {
-    log('UPGRADE', \`Received Upgrade request for \${req.url}\`, req.headers);
-
-    const proxySocket = net.connect(TARGET_PORT, TARGET_HOST, () => {
-        log('UPGRADE', 'Connected to Headscale, piping data...');
-        proxySocket.write(\`\${req.method} \${req.url} HTTP/1.1\r\n\`);
-        for (let i = 0; i < req.rawHeaders.length; i += 2) {
-            proxySocket.write(\`\${req.rawHeaders[i]}: \${req.rawHeaders[i+1]}\r\n\`);
-        }
-        proxySocket.write('\r\n');
-        proxySocket.write(head);
-        
-        proxySocket.pipe(socket);
-        socket.pipe(proxySocket);
-    });
-
-    proxySocket.on('error', (e) => {
-        log('UPGRADE_ERR', \`Socket Error: \${e.message}\`);
-        socket.end();
-    });
-});
-
 server.listen(8080, () => {
-    console.log('>>> DEBUG Proxy Ready on 8080. Waiting for traffic...');
+    log('>>> Node.js Proxy (Manual Handshake Edition) ready on 8080');
 });
 EOF
 
