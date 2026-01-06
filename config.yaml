@@ -53,8 +53,8 @@ tls:
 
 # Log 配置
 log:
-  level: info
-  format: text
+  level: debug   # 可选: info, error, debug. 建议先用 debug
+  format: text   # 可选: text, json. 建议用 text 方便肉眼看
 
 # Prometheus 监控 (可选)
 metrics_listen_addr: 127.0.0.1:9090
