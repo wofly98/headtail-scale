@@ -23,7 +23,7 @@ fi
 # 开启错误追踪，便于调试
 set -e
 
-# === 生成“全透明调试”版代理 (proxy.js) ===
+# === 生成“最终生产版”代理 (proxy.js) ===
 cat <<EOF > /proxy.js
 const http = require('http');
 const net = require('net');
@@ -34,34 +34,28 @@ const TARGET_HOST = '127.0.0.1';
 function log(msg) { console.log(\`[\${new Date().toISOString()}] \${msg}\`); }
 
 const server = http.createServer((clientReq, clientRes) => {
-    const reqId = Math.random().toString(36).substring(7);
     const mode = clientReq.headers['x-proxy-mode'];
-
-    // 1. 打印 Worker 发来的原始请求头，看看丢了没
-    log(\`[req:\${reqId}] INCOMING HEADERS:\n\${JSON.stringify(clientReq.headers, null, 2)}\`);
 
     // === 场景 A: 协议升级 (WebSocket 或 Tailscale) ===
     if (mode === 'upgrade') {
+        // 不再打印详细日志，追求极致速度
         const upgradeProto = clientReq.headers['x-upgrade-proto'] || 'websocket';
-        log(\`[req:\${reqId}] MODE: Manual Upgrade (\${upgradeProto})\`);
         
         const headscaleSocket = net.connect(TARGET_PORT, TARGET_HOST, () => {
-            // 构造请求 (强制 GET)
+            // 1. 构造完美的握手包 (已验证通过)
             let rawReq = \`GET /ts2021 HTTP/1.1\r\n\`;
             rawReq += \`Host: 127.0.0.1:\${TARGET_PORT}\r\n\`;
             rawReq += \`Connection: Upgrade\r\n\`;
             rawReq += \`Upgrade: \${upgradeProto}\r\n\`;
 
-            // 转发列表：把能想到的都加上，宁多勿少
+            // 2. 转发所有关键头 (包括 User-Agent 和 Handshake)
             const headersToForward = [
                 'sec-websocket-key',
                 'sec-websocket-protocol',
                 'sec-websocket-version',
                 'x-tailscale-handshake', 
                 'authorization',
-                'user-agent',       // <--- 新增：防止因缺少 UA 被拒绝
-                'accept-encoding',
-                'accept-language'
+                'user-agent'
             ];
 
             headersToForward.forEach(key => {
@@ -70,43 +64,34 @@ const server = http.createServer((clientReq, clientRes) => {
                 }
             });
 
-            // 补全 WebSocket Key
+            // 3. 补全 WebSocket Key (防御性)
             if (upgradeProto === 'websocket' && !clientReq.headers['sec-websocket-key']) {
                  rawReq += \`Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\`;
             }
 
             rawReq += \`\r\n\`; 
             
-            // 2. 打印我们将要发送给 Headscale 的原始报文
-            log(\`[req:\${reqId}] >>> OUTGOING RAW REQUEST:\n\${rawReq}\`);
-
+            // 4. 发送请求
             headscaleSocket.write(rawReq);
         });
-        
-        // 3. 监听 Headscale 的响应 (打印前 1024 字节)
-        let isFirstChunk = true;
-        headscaleSocket.on('data', (chunk) => {
-            if (isFirstChunk) {
-                const respStr = chunk.toString();
-                log(\`[req:\${reqId}] <<< INCOMING HEADSCALE RESPONSE:\n\${respStr.substring(0, 1024)}\`);
-                isFirstChunk = false;
-            }
-            clientReq.socket.write(chunk);
-        });
 
-        // 双向管道
-        clientReq.socket.on('data', (chunk) => {
-            headscaleSocket.write(chunk);
-        });
+        // === 关键修改：使用 Pipe 代替手动转发 ===
+        // Pipe 是 Node.js 底层最优化的流传输方式，零延迟，不丢包
         
-        headscaleSocket.on('end', () => log(\`[req:\${reqId}] Headscale closed connection\`));
+        // 客户端 -> Headscale
+        clientReq.socket.pipe(headscaleSocket);
+        
+        // Headscale -> 客户端
+        headscaleSocket.pipe(clientReq.socket);
+        
+        // 错误处理 (静默处理，防止崩溃)
         headscaleSocket.on('error', (e) => {
-             log(\`[req:\${reqId}] Headscale Socket Error: \${e.message}\`);
+             // log(\`Headscale Socket Error: \${e.message}\`);
              clientReq.socket.end();
         });
         clientReq.socket.on('error', (e) => {
-            log(\`[req:\${reqId}] Client Socket Error: \${e.message}\`);
-            headscaleSocket.end();
+             // log(\`Client Socket Error: \${e.message}\`);
+             headscaleSocket.end();
         });
 
         return; 
@@ -114,7 +99,6 @@ const server = http.createServer((clientReq, clientRes) => {
 
     // === 场景 B: Base64 解码 (/machine/register) ===
     if (mode === 'base64') {
-        log(\`[req:\${reqId}] MODE: Base64 Decode\`);
         const options = {
             hostname: TARGET_HOST,
             port: TARGET_PORT,
@@ -130,7 +114,6 @@ const server = http.createServer((clientReq, clientRes) => {
         delete options.headers['host'];
 
         const proxyReq = http.request(options, (proxyRes) => {
-            log(\`[req:\${reqId}] Register Response: \${proxyRes.statusCode}\`);
             clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
             proxyRes.pipe(clientRes, { end: true });
         });
@@ -143,9 +126,7 @@ const server = http.createServer((clientReq, clientRes) => {
                 const decodedBuffer = Buffer.from(bodyData, 'base64');
                 proxyReq.write(decodedBuffer);
                 proxyReq.end();
-                log(\`[req:\${reqId}] Sent Base64 Body (\${decodedBuffer.length} bytes)\`);
             } catch (e) {
-                log(\`[req:\${reqId}] Base64 Decode Error\`);
                 clientRes.writeHead(400);
                 clientRes.end();
             }
@@ -154,7 +135,6 @@ const server = http.createServer((clientReq, clientRes) => {
     }
 
     // === 场景 C: 普通透传 ===
-    log(\`[req:\${reqId}] MODE: Standard Proxy\`);
     const options = {
         hostname: TARGET_HOST,
         port: TARGET_PORT,
@@ -165,20 +145,14 @@ const server = http.createServer((clientReq, clientRes) => {
     delete options.headers['host'];
     
     const proxyReq = http.request(options, (proxyRes) => {
-        log(\`[req:\${reqId}] Standard Response: \${proxyRes.statusCode}\`);
         clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
         proxyRes.pipe(clientRes, { end: true });
     });
     
-    // 捕获请求错误
-    proxyReq.on('error', (e) => {
-        log(\`[req:\${reqId}] Proxy Request Error: \${e.message}\`);
-    });
-
     clientReq.pipe(proxyReq, { end: true });
 });
 
-server.listen(8080, () => { console.log('>>> Node.js DEBUG Proxy Ready'); });
+server.listen(8080, () => { console.log('>>> Node.js Proxy (Production) Ready'); });
 EOF
 
 # 初始化数据库（如果是第一次运行）
