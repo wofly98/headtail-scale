@@ -28,7 +28,7 @@ RUN mkdir -p /var/lib/headscale /var/lib/tailscale /var/run/tailscale /etc/heads
 # 安装 GOST
 RUN wget https://github.com/go-gost/gost/releases/download/v3.2.6/gost_3.2.6_linux_amd64.tar.gz && \
     tar xzf gost_3.2.6_linux_amd64.tar.gz && \
-    mv gost-linux-amd64 /usr/local/bin/gost && \
+    mv gost /usr/local/bin/gost && \
     chmod +x /usr/local/bin/gost
 
 # 复制配置
