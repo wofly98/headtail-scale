@@ -53,7 +53,7 @@ tls:
 
 # Log 配置
 log:
-  level: info   # 可选: info, error, debug. 建议先用 debug
+  level: trace   # 可选: info, error, debug. 建议先用 debug
   format: text   # 可选: text, json. 建议用 text 方便肉眼看
 
 # Prometheus 监控 (可选)
