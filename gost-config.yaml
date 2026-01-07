@@ -1,0 +1,22 @@
+services:
+  - name: ws-headscale
+    addr: :443
+    handler:
+      type: http
+    listener:
+      type: tcp
+    forwarder:
+      nodes:
+        - addr: 127.0.0.1:8080
+      transport:
+        type: ws  # WebSocket 传输
+        metadata:
+          path: /ws  # 自定义路径，避免根路径冲突
+          host: past-adelice-godsheaven-2114a06f.koyeb.app
+
+chains:  # 可选链式伪装
+  - name: ws-chain
+    hops:
+      - nodes:
+          - transport:
+              type: wss  # 如果需要 TLS（Koyeb 已提供）

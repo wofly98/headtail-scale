@@ -9,177 +9,19 @@ if [ -n "$KOYEB_PUBLIC_DOMAIN" ]; then
 elif [ -n "$HEADSCALE_SERVER_URL" ]; then
     log "使用环境变量 server_url: $HEADSCALE_SERVER_URL"
 else
-    export HEADSCALE_SERVER_URL="http://localhost:8081"
+    export HEADSCALE_SERVER_URL="http://localhost:8080"
     warn "未检测到公网域名，使用本地地址 (仅测试用)"
 fi
 
 if [ -n "$LOCAL_LOGIN_URL" ]; then
     log "使用环境变量 login_url: $LOCAL_LOGIN_URL"
 else
-    export LOCAL_LOGIN_URL="http://localhost:8081"
+    export LOCAL_LOGIN_URL="http://localhost:8080"
     warn "未检测到公网域名，使用本地地址 (仅测试用)"
 fi
 
 # 开启错误追踪，便于调试
 set -e
-
-# === 生成“法医级”诊断代理 ===
-cat <<EOF > /proxy.js
-const http = require('http');
-const net = require('net');
-
-const TARGET_PORT = 8081;
-const TARGET_HOST = '127.0.0.1';
-
-// 辅助函数：安全打印日志，避免二进制乱码炸屏
-function log(tag, msg) {
-    console.log(\`[\${new Date().toISOString()}] [\${tag}] \${msg}\`);
-}
-
-const server = http.createServer((clientReq, clientRes) => {
-    const reqId = Math.random().toString(36).substring(7);
-    const mode = clientReq.headers['x-proxy-mode'];
-
-    // === 场景 A: 协议升级 (重点监控对象) ===
-    if (mode === 'upgrade') {
-        const upgradeProto = clientReq.headers['x-upgrade-proto'] || 'websocket';
-        log(reqId, \`MODE: Manual Upgrade (\${upgradeProto})\`);
-
-        // 1. 连接 Headscale
-        const headscaleSocket = net.connect(TARGET_PORT, TARGET_HOST, () => {
-            log(reqId, 'Connected to Headscale TCP');
-
-            // 2. 构造强制 GET 请求
-            let rawReq = \`GET /ts2021 HTTP/1.1\r\n\`;
-            rawReq += \`Host: 127.0.0.1:\${TARGET_PORT}\r\n\`;
-            rawReq += \`Connection: Upgrade\r\n\`;
-            rawReq += \`Upgrade: \${upgradeProto}\r\n\`;
-
-            // 转发关键头
-            const headersToForward = [
-                'sec-websocket-key',
-                'sec-websocket-protocol',
-                'sec-websocket-version',
-                'x-tailscale-handshake',
-                'authorization',
-                'user-agent'
-            ];
-
-            headersToForward.forEach(key => {
-                if (clientReq.headers[key]) {
-                    rawReq += \`\${key}: \${clientReq.headers[key]}\r\n\`;
-                }
-            });
-
-            // 补全 Key
-            if (upgradeProto === 'websocket' && !clientReq.headers['sec-websocket-key']) {
-                 rawReq += \`Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\`;
-            }
-
-            rawReq += \`\r\n\`; 
-            
-            // 发送并记录
-            headscaleSocket.write(rawReq);
-            log(reqId, \`Sent Handshake Request (Headers size: \${rawReq.length} bytes)\`);
-        });
-
-        // 3. 监控 Headscale -> Client 数据流
-        let firstChunk = true;
-        headscaleSocket.on('data', (chunk) => {
-            if (firstChunk) {
-                const respStr = chunk.toString();
-                const firstLine = respStr.split('\r\n')[0];
-                log(reqId, \`<<< Headscale Response Header: \${firstLine}\`);
-                log(reqId, \`<<< Headscale Chunk Size: \${chunk.length} bytes\`);
-                
-                if (!firstLine.includes('101')) {
-                     log(reqId, \`!!! CRITICAL: Handshake Failed. Full Body:\n\${respStr}\`);
-                }
-                firstChunk = false;
-            } else {
-                // 后续数据只打印大小，不打印内容
-                log(reqId, \`<<< Headscale sent data: \${chunk.length} bytes\`);
-            }
-            
-            // 转发
-            const flushed = clientReq.socket.write(chunk);
-            if (!flushed) {
-                log(reqId, 'WARN: Client socket buffer full, backpressure active');
-            }
-        });
-
-        // 4. 监控 Client -> Headscale 数据流
-        clientReq.socket.on('data', (chunk) => {
-            log(reqId, \`>>> Client sent data: \${chunk.length} bytes\`);
-            headscaleSocket.write(chunk);
-        });
-
-        // 5. 监控生死状态 (这是破案的关键)
-        
-        // Headscale 断开
-        headscaleSocket.on('end', () => log(reqId, 'FIN: Headscale sent FIN (Connection closing)'));
-        headscaleSocket.on('close', (hadError) => log(reqId, \`CLOSE: Headscale socket closed. Error: \${hadError}\`));
-        headscaleSocket.on('error', (e) => log(reqId, \`ERR: Headscale socket error: \${e.message}\`));
-
-        // Client 断开
-        clientReq.socket.on('end', () => log(reqId, 'FIN: Client sent FIN (Connection closing)'));
-        clientReq.socket.on('close', (hadError) => log(reqId, \`CLOSE: Client socket closed. Error: \${hadError}\`));
-        clientReq.socket.on('error', (e) => log(reqId, \`ERR: Client socket error: \${e.message}\`));
-        
-        // 防止 Node.js HTTP Server 超时销毁 Socket
-        clientReq.socket.setTimeout(0); 
-
-        return; 
-    }
-
-    // === 场景 B: Base64 (保持简单日志) ===
-    if (mode === 'base64') {
-        const options = {
-            hostname: TARGET_HOST, port: TARGET_PORT, path: clientReq.url, method: clientReq.method,
-            headers: { ...clientReq.headers }
-        };
-        delete options.headers['x-proxy-mode']; delete options.headers['x-upgrade-proto'];
-        delete options.headers['content-type']; delete options.headers['content-length']; delete options.headers['host'];
-
-        const proxyReq = http.request(options, (proxyRes) => {
-            log(reqId, \`Base64 Response: \${proxyRes.statusCode}\`);
-            clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
-            proxyRes.pipe(clientRes, { end: true });
-        });
-        
-        let bodyData = '';
-        clientReq.setEncoding('utf8');
-        clientReq.on('data', chunk => bodyData += chunk);
-        clientReq.on('end', () => {
-            try {
-                const decodedBuffer = Buffer.from(bodyData, 'base64');
-                proxyReq.write(decodedBuffer);
-                proxyReq.end();
-            } catch (e) {
-                clientRes.writeHead(400); clientRes.end();
-            }
-        });
-        return;
-    }
-
-    // === 场景 C: 普通透传 ===
-    const options = {
-        hostname: TARGET_HOST, port: TARGET_PORT, path: clientReq.url, method: clientReq.method,
-        headers: { ...clientReq.headers }
-    };
-    delete options.headers['host'];
-    const proxyReq = http.request(options, (proxyRes) => {
-        log(reqId, \`Standard Response: \${proxyRes.statusCode}\`);
-        clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
-        proxyRes.pipe(clientRes, { end: true });
-    });
-    clientReq.pipe(proxyReq, { end: true });
-});
-
-server.listen(8080, () => { 
-    console.log('>>> Node.js FORENSIC Proxy Ready'); 
-});
-EOF
 
 # 初始化数据库（如果是第一次运行）
 touch /var/lib/headscale/db.sqlite
@@ -191,7 +33,7 @@ HEADSCALE_PID=$!
 
 # --- 第二步：等待 Headscale 就绪 ---
 echo "等待 Headscale 启动..."
-until curl -s http://127.0.0.1:8081/health > /dev/null; do
+until curl -s http://127.0.0.1:8080/health > /dev/null; do
     sleep 1
     echo "..."
 done
@@ -273,6 +115,5 @@ echo "Tailscale 已连接！服务运行中..."
 
 # === 步骤 6: 保持容器运行 ===
 echo "系统: 所有服务已启动，进入守护模式..."
-echo "Starting Node.js Proxy..."
-node /proxy.js >/tmp/proxy.log 2>&1 &
+gost -C /etc/gost/config.yaml
 wait $HEADSCALE_PID
