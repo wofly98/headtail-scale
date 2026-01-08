@@ -115,5 +115,6 @@ echo "Tailscale 已连接！服务运行中..."
 
 # === 步骤 6: 保持容器运行 ===
 echo "系统: 所有服务已启动，进入守护模式..."
-gost -C /etc/gost/config.yaml
+#gost -C /etc/gost/config.yaml
+exec /usr/local/bin/header-proxy
 wait $HEADSCALE_PID
