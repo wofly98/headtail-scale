@@ -31,9 +31,9 @@ RUN wget https://github.com/juanfont/headscale/releases/download/v${HEADSCALE_VE
     rm headscale_${HEADSCALE_VERSION}_linux_${TS_ARCH}
 
 
-## 创建必要的目录
-#RUN mkdir -p /var/lib/headscale /var/lib/tailscale /var/run/tailscale /etc/headscale
-#
+# 创建必要的目录
+RUN mkdir -p /var/lib/headscale /var/lib/tailscale /var/run/tailscale /etc/headscale
+
 ## 安装 GOST
 #RUN wget https://github.com/go-gost/gost/releases/download/v3.2.6/gost_3.2.6_linux_amd64.tar.gz && \
 #    tar xzf gost_3.2.6_linux_amd64.tar.gz && \
