@@ -50,8 +50,6 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	tsHandshake := r.URL.Query().Get("ts_handshake")
 
 	log.Printf("[TUNNEL] Starting tunnel handshake...")
-	log.Printf("[TUNNEL] WS-Key: %s", wsKey)
-	log.Printf("[TUNNEL] TS-Handshake Length: %d", len(tsHandshake))
 
 	if wsKey == "" || tsHandshake == "" {
 		msg := fmt.Sprintf("Missing Headers. WSKey=%v, HandshakeLen=%d", wsKey != "", len(tsHandshake))
@@ -66,14 +64,14 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Hijack not supported", http.StatusInternalServerError)
 		return
 	}
-	clientConn, _, err := hj.Hijack()
+	
+	// 【关键修复】获取 clientBuf (缓冲区)
+	clientConn, clientBuf, err := hj.Hijack()
 	if err != nil {
 		log.Printf("[TUNNEL_FAIL] Hijack error: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	// 注意：Hijack 后必须手动管理连接关闭
-	// defer clientConn.Close() // 移到下方 errChan 处理完后关闭
 
 	destConn, err := net.DialTimeout("tcp", targetHost, 5*time.Second)
 	if err != nil {
@@ -120,16 +118,29 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 
 	// [D] 管道转发
 	errChan := make(chan error, 2)
+	
+	// Client -> Headscale
 	go func() {
+		// 【关键修复】先清空缓冲区，再读 Socket
+		// 如果不加上这一步，Headscale 将永远收不到第一个数据包，导致死锁/502
+		if clientBuf.Reader.Buffered() > 0 {
+			if _, err := io.Copy(destConn, clientBuf); err != nil {
+				errChan <- err
+				return
+			}
+		}
+		
+		// 缓冲区读完后，继续读 TCP 连接
 		_, copyErr := io.Copy(destConn, clientConn)
 		errChan <- copyErr
 	}()
+	
+	// Headscale -> Client
 	go func() {
 		_, copyErr := br.WriteTo(clientConn)
 		errChan <- copyErr
 	}()
 
-	// 【修复点】使用新变量名 tunnelErr，避免重复声明导致编译错误
 	tunnelErr := <-errChan
 	log.Printf("[TUNNEL_END] Connection closed: %v", tunnelErr)
 	clientConn.Close()
@@ -163,6 +174,6 @@ func main() {
 		Addr:    ":" + port,
 		Handler: http.HandlerFunc(handleRequest),
 	}
-	log.Printf("Debug-Proxy listening on :%s", port)
+	log.Printf("Fixed-Proxy listening on :%s", port)
 	log.Fatal(server.ListenAndServe())
 }
