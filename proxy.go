@@ -8,18 +8,19 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"time"
+	// 已移除 "net/url"，因为没有显式使用 url.Parse
 )
 
 const (
-	targetURL = "127.0.0.1:8080" // TCP Dial 地址
-	// WebSocket 协议规定的魔术字符串
+	targetURL = "127.0.0.1:8080"
+	// WebSocket 协议规定的魔术字符串 (Magic GUID)
 	websocketGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 )
 
 // 计算 WebSocket 握手响应 Key
+// 算法：Base64(SHA1(Sec-WebSocket-Key + GUID))
 func computeAcceptKey(challengeKey string) string {
 	h := sha1.New()
 	io.WriteString(h, challengeKey)
@@ -29,20 +30,20 @@ func computeAcceptKey(challengeKey string) string {
 
 func handleRequest(w http.ResponseWriter, r *http.Request) {
 	// --- 1. 解析入站请求 (来自 Cloudflare) ---
-	// 我们期待的是 Upgrade: websocket
-	// 并且 handshake 数据藏在 URL 参数 "ts_handshake" 中
+	// Cloudflare 发来的是标准 WebSocket 请求
+	// 我们约定：真实的握手数据放在 URL 参数 "ts_handshake" 中
 	
 	wsKey := r.Header.Get("Sec-WebSocket-Key")
 	tsHandshake := r.URL.Query().Get("ts_handshake")
 
-	// 如果没有 WS Key 或没有 Handshake 参数，视为普通请求或非法请求
+	// 校验必要参数
 	if wsKey == "" || tsHandshake == "" {
-		http.Error(w, "Invalid Handshake", http.StatusBadRequest)
+		http.Error(w, "Invalid Handshake Parameters", http.StatusBadRequest)
 		return
 	}
 
 	// --- 2. 劫持连接 (Hijack) ---
-	// 在回应任何数据前，必须先劫持 TCP 连接
+	// 必须在发送任何响应之前接管 TCP 连接
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "Hijack not supported", http.StatusInternalServerError)
@@ -53,21 +54,21 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// 注意：劫持后必须负责关闭连接
 	defer clientConn.Close()
 
 	// --- 3. 连接 Headscale (后端) ---
 	destConn, err := net.DialTimeout("tcp", targetURL, 5*time.Second)
 	if err != nil {
 		log.Printf("Dial Headscale failed: %v", err)
-		clientConn.Close() // 必须手动关闭
 		return
 	}
 	defer destConn.Close()
 
-	// --- 4. 核心：协议转换 ---
+	// --- 4. 协议欺骗 (核心逻辑) ---
 
-	// [A] 向 Cloudflare 发送"假"的 WebSocket 握手成功响应
-	// 这样 Cloudflare 认为 WebSocket 建立成功，开始透传数据
+	// [A] 欺骗 Cloudflare：发送 WebSocket 101 握手成功响应
+	// 这样 Cloudflare 认为连接已建立，开始透传数据
 	acceptKey := computeAcceptKey(wsKey)
 	respToClient := "HTTP/1.1 101 Switching Protocols\r\n" +
 		"Upgrade: websocket\r\n" +
@@ -80,8 +81,8 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// [B] 向 Headscale 发送"真"的 Tailscale 握手请求
-	// 此时 Headscale 看到的是标准的 Tailscale 协议
+	// [B] 欺骗 Headscale：发送 Tailscale HTTP 升级请求
+	// 将 URL 参数里的 ts_handshake 还原回 X-Tailscale-Handshake 头
 	reqToBackend := "POST /ts2021 HTTP/1.1\r\n" +
 		"Host: 127.0.0.1:8080\r\n" +
 		"Upgrade: tailscale-control-protocol\r\n" +
@@ -95,8 +96,8 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// [C] 消费 Headscale 的响应头
-	// Headscale 会回复 HTTP 101，我们需要读取它但不转发给客户端
-	// 因为我们刚才已经给客户端发过 101 了 (respToClient)
+	// Headscale 会回复 HTTP 101，我们需要把它读取出来丢掉
+	// 因为我们刚才已经在 [A] 步给 Cloudflare 发过 101 了，不能发两次
 	br := bufio.NewReader(destConn)
 	for {
 		line, err := br.ReadString('\n')
@@ -104,32 +105,32 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			log.Printf("Read backend header failed: %v", err)
 			return
 		}
-		// 遇到空行，说明 Header 结束，后面是二进制流
+		// HTTP 头以空行 (\r\n) 结束
 		if line == "\r\n" {
 			break
 		}
 	}
 
-	// --- 5. 管道对接 (Streaming) ---
-	// 此时双方都认为握手完成，直接交换 Noise 协议的二进制数据
+	// --- 5. 双向管道对接 (Streaming) ---
+	// 握手完成，进入纯二进制流转发模式
 	
 	errChan := make(chan error, 2)
+	
+	// 协程 1: Client -> Headscale
 	go func() {
-		// client -> headscale
-		// 注意：Headscale 不需要读取客户端发送的 HTTP Body，
-		// 因为握手信息已经在 Header (X-Tailscale-Handshake) 里发过去了
-		// 所以这里直接转发后续的 TCP 数据
+		// 直接转发，因为 Headscale 已经通过 Header 拿到了握手数据
 		_, err := io.Copy(destConn, clientConn)
 		errChan <- err
 	}()
 	
+	// 协程 2: Headscale -> Client
 	go func() {
-		// headscale -> client (Headscale 响应 Body -> Client)
-		// 注意我们要用 br (bufio reader) 因为刚才预读了 Header
+		// 使用 br.WriteTo 因为 br 可能预读了部分 Headscale 的 Body 数据
 		_, err := br.WriteTo(clientConn)
 		errChan <- err
 	}()
 
+	// 等待任意一方断开
 	<-errChan
 }
 

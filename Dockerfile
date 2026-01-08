@@ -2,8 +2,13 @@
 FROM golang:alpine AS builder
 WORKDIR /app
 COPY proxy.go .
-# 静态编译，确保在 alpine 中能运行
-RUN go build -ldflags "-s -w" -o header-proxy proxy.go
+
+# 初始化一个临时的 go module，确保依赖解析正常
+RUN go mod init proxy
+
+# CGO_ENABLED=0 确保静态链接，不依赖系统库
+# -s -w 去除调试符号，减小体积
+RUN CGO_ENABLED=0 go build -ldflags "-s -w" -o header-proxy proxy.go
 
 FROM alpine:latest
 
