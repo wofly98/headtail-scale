@@ -1,70 +1,103 @@
 package main
 
 import (
+	"bufio"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 )
 
-// Headscale 监听的本地地址
 const targetURL = "http://127.0.0.1:8080"
 
 func handleRequest(w http.ResponseWriter, r *http.Request) {
-	// 解析目标地址
 	u, _ := url.Parse(targetURL)
 
-	// ---------------------------------------------------------
-	// 核心逻辑：Header 还原
-	// Cloudflare 发来的是 Upgrade: websocket
-	// Headscale 需要的是 Upgrade: tailscale-control-protocol
-	// ---------------------------------------------------------
+	// --- 1. 请求头伪装 (Worker -> Headscale) ---
+	r.Header.Set("Connection", "Upgrade")
 	if r.Header.Get("Upgrade") == "websocket" {
 		r.Header.Set("Upgrade", "tailscale-control-protocol")
 	}
+	r.Host = u.Host
+	r.Header.Set("Host", u.Host)
 
-	// 建立到 Headscale 的 TCP 连接
+	// --- 2. 连接 Headscale ---
 	destConn, err := net.DialTimeout("tcp", u.Host, 5*time.Second)
 	if err != nil {
 		http.Error(w, "Backend Unavailable", http.StatusBadGateway)
-		log.Printf("Error dialing backend: %v", err)
 		return
 	}
 	defer destConn.Close()
 
-	// 劫持客户端连接 (Hijack) 以便进行双向透传
+	// --- 3. 劫持客户端连接 ---
 	hj, ok := w.(http.Hijacker)
 	if !ok {
-		http.Error(w, "Server doesn't support hijacking", http.StatusInternalServerError)
+		http.Error(w, "No hijack", http.StatusInternalServerError)
 		return
 	}
-	clientConn, _, err := hj.Hijack()
+	clientConn, clientBuf, err := hj.Hijack()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer clientConn.Close()
 
-	// 重写请求并发送给 Headscale
-	// 注意：必须重新构造 HTTP 请求行，因为我们现在是在 TCP 层操作
-	r.URL.Scheme = "http"
-	r.URL.Host = u.Host
+	// --- 4. 发送请求给 Headscale ---
 	if err := r.Write(destConn); err != nil {
-		log.Printf("Error writing to backend: %v", err)
 		return
 	}
 
-	// 建立双向数据管道
+	// 补发缓冲区数据 (修复上一轮的丢包问题)
+	if clientBuf.Reader.Buffered() > 0 {
+		io.Copy(destConn, clientBuf)
+	}
+
+	// --- 5. 响应头伪装 (Headscale -> Worker) [新增核心修复] ---
+	// 我们不能直接 io.Copy 响应，因为必须修改 Upgrade 头
+	
 	errChan := make(chan error, 2)
+
 	go func() {
-		_, err := io.Copy(destConn, clientConn)
+		// 使用 bufio 读取 Headscale 的响应头，逐行处理
+		remoteReader := bufio.NewReader(destConn)
+		for {
+			line, err := remoteReader.ReadString('\n')
+			if err != nil {
+				errChan <- err
+				return
+			}
+
+			// 检查并替换 Upgrade 头
+			// Headscale 发送: Upgrade: tailscale-control-protocol
+			// 我们需要改为:   Upgrade: websocket
+			if strings.HasPrefix(line, "Upgrade: tailscale-control-protocol") {
+				line = "Upgrade: websocket\r\n"
+			}
+
+			// 写入修改后的行给客户端 (Worker)
+			if _, err := clientConn.Write([]byte(line)); err != nil {
+				errChan <- err
+				return
+			}
+
+			// 空行表示 Header 结束，Body (数据流) 开始
+			if line == "\r\n" {
+				break
+			}
+		}
+
+		// Header 处理完后，直接透传剩余的数据流 (Noise 协议数据)
+		_, err := io.Copy(clientConn, remoteReader)
 		errChan <- err
 	}()
+
+	// --- 6. 客户端数据透传 (Client -> Headscale) ---
 	go func() {
-		_, err := io.Copy(clientConn, destConn)
+		_, err := io.Copy(destConn, clientConn)
 		errChan <- err
 	}()
 
@@ -74,15 +107,14 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8000" // Koyeb 默认端口
+		port = "8000"
 	}
-
-	http.HandleFunc("/", handleRequest)
-	
-	log.Printf("Proxy server started. Listening on 0.0.0.0:%s", port)
-	log.Printf("Forwarding targets to %s", targetURL)
-	
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		log.Fatal(err)
+	// 增加超时设置，避免连接卡死
+	server := &http.Server{
+		Addr:        ":" + port,
+		Handler:     http.HandlerFunc(handleRequest),
+		IdleTimeout: 120 * time.Second,
 	}
+	log.Printf("Proxy listening on :%s", port)
+	log.Fatal(server.ListenAndServe())
 }
