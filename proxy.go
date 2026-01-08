@@ -17,22 +17,22 @@ const targetURL = "http://127.0.0.1:8080"
 func handleRequest(w http.ResponseWriter, r *http.Request) {
 	u, _ := url.Parse(targetURL)
 
-	// --- 1. 请求头深度伪装 (Worker -> Headscale) ---
-	// 确保 Connection 为 Upgrade
+	// --- 1. 请求头还原 (Worker -> Headscale) ---
 	r.Header.Set("Connection", "Upgrade")
 	
-	// 如果是 Worker 发来的 Websocket 伪装流量
 	if r.Header.Get("Upgrade") == "websocket" {
-		// 【关键修复 1】: 强制指定子协议，满足 Headscale 的 WebSocket 校验逻辑
-		r.Header.Set("Sec-WebSocket-Protocol", "tailscale-control-protocol")
+		r.Header.Set("Upgrade", "tailscale-control-protocol")
 		
-		// 保持 Upgrade 为 websocket，让 Headscale 走 WebSocket 处理流程 (路径 B)
-		// 这样兼容性更好，因为 Cloudflare 和 Koyeb 对 websocket 支持最完善
-		r.Header.Set("Upgrade", "websocket")
-	} else {
-        // 如果是其他情况，强制修正为 tailscale 协议（兜底）
-        r.Header.Set("Upgrade", "tailscale-control-protocol")
-    }
+		// 【关键修复】从 Sec-WebSocket-Protocol 提取 handshake 数据
+		// Worker 把 X-Tailscale-Handshake 藏在了这里
+		handshake := r.Header.Get("Sec-WebSocket-Protocol")
+		if handshake != "" {
+			// 还原回 Headscale 需要的 Header
+			r.Header.Set("X-Tailscale-Handshake", handshake)
+			// 清理掉伪装的 Protocol 头，以免 Headscale 误判为 WebSocket 模式
+			r.Header.Del("Sec-WebSocket-Protocol")
+		}
+	}
 
 	r.Host = u.Host
 	r.Header.Set("Host", u.Host)
@@ -59,7 +59,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	defer clientConn.Close()
 
-	// --- 4. 写入请求头给 Headscale ---
+	// --- 4. 写入修改后的请求头 ---
 	if err := r.Write(destConn); err != nil {
 		log.Printf("Write request failed: %v", err)
 		return
@@ -82,17 +82,14 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			// 【关键修复 2】: 响应头清洗
-			// Headscale 回复: Sec-WebSocket-Protocol: tailscale-control-protocol
-			// Worker 可能不认这个头，或者我们需要隐藏它
-			// 但最重要的是确保 Upgrade: websocket 被正确返回
+			// 强制确保返回给 Worker 的是 websocket，骗过 Worker 的 fetch 检查
 			if strings.HasPrefix(line, "Upgrade:") {
-				// 强制确保返回给 Koyeb/Worker 的是 websocket
 				line = "Upgrade: websocket\r\n"
 			}
             
-            // 可选：如果不需要把子协议暴露给外网，可以过滤掉 Sec-WebSocket-Protocol 响应头
-            // 但为了保证握手严谨性，保留它通常没问题，只要 Upgrade 对了就行
+            // 为了防止 Worker 或 Koyeb 对响应头进行严格校验
+            // 我们可以在这里也伪造一个 Sec-WebSocket-Protocol 响应
+            // 但通常只要 Upgrade 对了就行，这里保持简单
 
 			if _, err := clientConn.Write([]byte(line)); err != nil {
 				errChan <- err
@@ -104,7 +101,6 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// 透传剩余数据流
 		_, err := io.Copy(clientConn, remoteReader)
 		errChan <- err
 	}()
@@ -127,6 +123,6 @@ func main() {
 		Handler:     http.HandlerFunc(handleRequest),
 		IdleTimeout: 120 * time.Second,
 	}
-	log.Printf("Proxy listening on :%s", port)
+	log.Printf("Proxy (Header Smuggling Fixed) listening on :%s", port)
 	log.Fatal(server.ListenAndServe())
 }
