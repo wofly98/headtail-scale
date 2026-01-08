@@ -32,7 +32,6 @@ func init() {
 		originalDirector(req)
 		req.Host = u.Host
 	}
-	// 增加错误日志，如果反向代理出错，打印原因
 	standardProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		log.Printf("[PROXY_ERR] ReverseProxy failed: %v", err)
 		http.Error(w, "Proxy Error", http.StatusBadGateway)
@@ -122,21 +121,21 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	// [D] 管道转发
 	errChan := make(chan error, 2)
 	go func() {
-		_, err := io.Copy(destConn, clientConn)
-		errChan <- err
+		_, copyErr := io.Copy(destConn, clientConn)
+		errChan <- copyErr
 	}()
 	go func() {
-		_, err := br.WriteTo(clientConn)
-		errChan <- err
+		_, copyErr := br.WriteTo(clientConn)
+		errChan <- copyErr
 	}()
 
-	err := <-errChan
-	log.Printf("[TUNNEL_END] Connection closed: %v", err)
+	// 【修复点】使用新变量名 tunnelErr，避免重复声明导致编译错误
+	tunnelErr := <-errChan
+	log.Printf("[TUNNEL_END] Connection closed: %v", tunnelErr)
 	clientConn.Close()
 }
 
 func handleRequest(w http.ResponseWriter, r *http.Request) {
-	// 打印详细的请求特征，用于排查匹配失败原因
 	upgrade := r.Header.Get("Upgrade")
 	handshakeParam := r.URL.Query().Get("ts_handshake")
 	
