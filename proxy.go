@@ -16,26 +16,25 @@ import (
 )
 
 const (
-	targetHost = "127.0.0.1:8080"
-	targetURL  = "http://127.0.0.1:8080"
-	wsGUID     = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+	targetHost    = "127.0.0.1:8080" // TCP 连接地址
+	targetHttpURL = "http://127.0.0.1:8080" // HTTP 代理地址
+	wsGUID        = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 )
 
-// 全局普通反向代理实例
 var standardProxy *httputil.ReverseProxy
 
 func init() {
-	u, _ := url.Parse(targetURL)
+	u, _ := url.Parse(targetHttpURL)
 	standardProxy = httputil.NewSingleHostReverseProxy(u)
-	
-	// 自定义 Director 以确保 Host 头正确
-	originalDirector := standardProxy.Director
+	// 修正 Host 头，否则 Headscale 可能拒绝
+	d := standardProxy.Director
 	standardProxy.Director = func(req *http.Request) {
-		originalDirector(req)
-		req.Host = u.Host
+		d(req)
+		req.Host = "127.0.0.1:8080"
 	}
 }
 
+// 算法：计算 WebSocket 握手校验码
 func computeAcceptKey(challengeKey string) string {
 	h := sha1.New()
 	io.WriteString(h, challengeKey)
@@ -43,20 +42,22 @@ func computeAcceptKey(challengeKey string) string {
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
 
-// 处理隧道连接 (协议欺骗逻辑)
+// 核心逻辑：协议转换隧道
 func handleTunnel(w http.ResponseWriter, r *http.Request) {
+	// 1. 获取必要的握手参数
 	wsKey := r.Header.Get("Sec-WebSocket-Key")
 	tsHandshake := r.URL.Query().Get("ts_handshake")
 
-	// 严格校验：必须有 WS Key 和 Handshake 参数
+	// 如果参数不全，说明协议链断了，拒绝连接
 	if wsKey == "" || tsHandshake == "" {
-		http.Error(w, "Invalid Tunnel Request", http.StatusBadRequest)
+		http.Error(w, "Protocol Mismatch: Missing Handshake Data", http.StatusBadRequest)
 		return
 	}
 
+	// 2. 劫持 TCP 连接 (Hijack)
 	hj, ok := w.(http.Hijacker)
 	if !ok {
-		http.Error(w, "Hijack not supported", http.StatusInternalServerError)
+		http.Error(w, "Server Hijack Not Supported", http.StatusInternalServerError)
 		return
 	}
 	clientConn, _, err := hj.Hijack()
@@ -66,73 +67,88 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	}
 	defer clientConn.Close()
 
+	// 3. 连接 Headscale (TCP Dial)
 	destConn, err := net.DialTimeout("tcp", targetHost, 5*time.Second)
 	if err != nil {
-		log.Printf("Dial Headscale failed: %v", err)
+		log.Printf("Dial Backend Failed: %v", err)
 		return
 	}
 	defer destConn.Close()
 
-	// [A] 欺骗 Cloudflare (回写 101)
+	// --- 阶段 A: 完成上游 (Worker) 的 WebSocket 握手 ---
+	// 必须回复标准的 WebSocket 101，否则 Cloudflare 会切断连接
 	acceptKey := computeAcceptKey(wsKey)
-	respToClient := "HTTP/1.1 101 Switching Protocols\r\n" +
+	respToWorker := "HTTP/1.1 101 Switching Protocols\r\n" +
 		"Upgrade: websocket\r\n" +
 		"Connection: Upgrade\r\n" +
 		"Sec-WebSocket-Accept: " + acceptKey + "\r\n" +
 		"\r\n"
 	
-	if _, err := clientConn.Write([]byte(respToClient)); err != nil {
+	if _, err := clientConn.Write([]byte(respToWorker)); err != nil {
+		log.Printf("Write to Client Failed: %v", err)
 		return
 	}
 
-	// [B] 欺骗 Headscale (发送 Tailscale 握手)
-	reqToBackend := "POST /ts2021 HTTP/1.1\r\n" +
+	// --- 阶段 B: 发起下游 (Headscale) 的 Tailscale 握手 ---
+	// 还原为 Headscale 能识别的标准 HTTP Upgrade 请求
+	reqToHeadscale := "POST /ts2021 HTTP/1.1\r\n" +
 		"Host: 127.0.0.1:8080\r\n" +
 		"Upgrade: tailscale-control-protocol\r\n" +
 		"Connection: Upgrade\r\n" +
 		"X-Tailscale-Handshake: " + tsHandshake + "\r\n" +
 		"\r\n"
 
-	if _, err := destConn.Write([]byte(reqToBackend)); err != nil {
+	if _, err := destConn.Write([]byte(reqToHeadscale)); err != nil {
+		log.Printf("Write to Backend Failed: %v", err)
 		return
 	}
 
-	// [C] 丢弃 Headscale 的响应头
+	// --- 阶段 C: 响应清洗 ---
+	// Headscale 会回复 HTTP 101，但我们已经给 Worker 发过 101 了
+	// 所以必须把 Headscale 的 Header 读取出来丢掉
 	br := bufio.NewReader(destConn)
 	for {
 		line, err := br.ReadString('\n')
-		if err != nil || line == "\r\n" {
-			break
+		if err != nil {
+			return 
+		}
+		if line == "\r\n" {
+			break // Header 读取完毕，之后是 Body
 		}
 	}
 
-	// [D] 管道透传
+	// --- 阶段 D: 全双工流转发 ---
 	errChan := make(chan error, 2)
+	
+	// Worker -> Headscale
 	go func() {
 		_, err := io.Copy(destConn, clientConn)
 		errChan <- err
 	}()
+	
+	// Headscale -> Worker
 	go func() {
+		// 注意使用 br.WriteTo，因为 br 可能缓冲了部分 Body 数据
 		_, err := br.WriteTo(clientConn)
 		errChan <- err
 	}()
+
 	<-errChan
 }
 
 func handleRequest(w http.ResponseWriter, r *http.Request) {
-	// --- 路由分发核心 ---
+	// 严格的分流逻辑
 	
-	// 判断 1: 是否是 WebSocket 升级请求 (Tailscale 隧道)
-	isWS := strings.Contains(strings.ToLower(r.Header.Get("Upgrade")), "websocket")
-	
-	// 判断 2: 是否携带了关键的握手参数
+	// 检查是否是合法的隧道请求 (必须包含 Upgrade 头 和 握手参数)
+	upgrade := strings.ToLower(r.Header.Get("Upgrade"))
 	hasHandshake := r.URL.Query().Get("ts_handshake") != ""
+	isWS := strings.Contains(upgrade, "websocket")
 
 	if isWS && hasHandshake {
-		// 进入隧道模式 (Deep Packet Transcoding)
+		// 走协议转换通道
 		handleTunnel(w, r)
 	} else {
-		// 进入普通代理模式 (处理 /key, /health 等)
+		// 走普通 HTTP 代理 (/key, /health 等)
 		standardProxy.ServeHTTP(w, r)
 	}
 }
@@ -142,10 +158,14 @@ func main() {
 	if port == "" {
 		port = "8000"
 	}
+	
 	server := &http.Server{
 		Addr:    ":" + port,
 		Handler: http.HandlerFunc(handleRequest),
+		// 增加超时防止死锁
+		IdleTimeout: 120 * time.Second, 
 	}
-	log.Printf("Dual-Mode Proxy listening on :%s", port)
+	
+	log.Printf("Strict-Protocol-Proxy listening on :%s", port)
 	log.Fatal(server.ListenAndServe())
 }
