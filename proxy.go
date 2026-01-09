@@ -10,7 +10,6 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// 这里是全链路唯一配置实际服务地址的地方
 const headscaleTarget = "127.0.0.1:8080"
 
 var upgrader = websocket.Upgrader{
@@ -18,7 +17,6 @@ var upgrader = websocket.Upgrader{
 }
 
 func handleTunnel(w http.ResponseWriter, r *http.Request) {
-	// 1. 隧道接入
 	wsConn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("Upgrade Error: %v", err)
@@ -26,7 +24,6 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	}
 	defer wsConn.Close()
 
-	// 2. 连接实际业务服务 (Headscale)
 	tcpConn, err := net.Dial("tcp", headscaleTarget)
 	if err != nil {
 		log.Printf("Dial Target Error: %v", err)
@@ -38,7 +35,7 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 
 	errChan := make(chan error, 2)
 
-	// --- 收 (WS -> Base64 Decode -> TCP) ---
+	// WS -> TCP
 	go func() {
 		for {
 			_, message, err := wsConn.ReadMessage()
@@ -46,14 +43,11 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 				errChan <- err
 				return
 			}
-			// 解码 Worker 传来的密文
 			rawBytes, err := base64.StdEncoding.DecodeString(string(message))
 			if err != nil {
-				// 解码失败跳过，保持连接不断
 				log.Printf("Decode Error: %v", err)
 				continue
 			}
-			// 写入本地服务
 			if _, err := tcpConn.Write(rawBytes); err != nil {
 				errChan <- err
 				return
@@ -61,7 +55,7 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// --- 发 (TCP -> Base64 Encode -> WS) ---
+	// TCP -> WS
 	go func() {
 		buffer := make([]byte, 32*1024)
 		for {
@@ -70,9 +64,7 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 				errChan <- err
 				return
 			}
-			// 编码本地服务的原始响应
 			encodedMsg := base64.StdEncoding.EncodeToString(buffer[:n])
-			
 			if err := wsConn.WriteMessage(websocket.TextMessage, []byte(encodedMsg)); err != nil {
 				errChan <- err
 				return
@@ -80,8 +72,10 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	<-errChan
-	log.Printf("[Tunnel] Closed")
+	// 等待任意一方报错或关闭
+	exitErr := <-errChan
+	// 【关键修改】打印具体错误原因，方便排查是 EOF 还是 Timeout
+	log.Printf("[Tunnel] Closed. Reason: %v", exitErr)
 }
 
 func main() {
@@ -90,6 +84,6 @@ func main() {
 		port = "8000"
 	}
 	http.HandleFunc("/tunnel", handleTunnel)
-	log.Printf("Base64 Tunnel listening on :%s", port)
+	log.Printf("Debug-Tunnel listening on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
