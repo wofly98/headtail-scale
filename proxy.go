@@ -2,8 +2,6 @@ package main
 
 import (
 	"bufio"
-	"crypto/sha1"
-	"encoding/base64"
 	"fmt"
 	"io"
 	"log"
@@ -12,14 +10,12 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"strings"
 	"time"
 )
 
 const (
 	targetHost = "127.0.0.1:8080"
 	targetURL  = "http://127.0.0.1:8080"
-	wsGUID     = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 )
 
 var standardProxy *httputil.ReverseProxy
@@ -27,140 +23,111 @@ var standardProxy *httputil.ReverseProxy
 func init() {
 	u, _ := url.Parse(targetURL)
 	standardProxy = httputil.NewSingleHostReverseProxy(u)
-	originalDirector := standardProxy.Director
+	d := standardProxy.Director
 	standardProxy.Director = func(req *http.Request) {
-		originalDirector(req)
-		req.Host = u.Host
+		d(req)
+		req.Host = "127.0.0.1:8080"
 	}
 	standardProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Printf("[PROXY_ERR] ReverseProxy failed: %v", err)
+		log.Printf("[PROXY_ERR] %v", err)
 		http.Error(w, "Proxy Error", http.StatusBadGateway)
 	}
 }
 
-func computeAcceptKey(challengeKey string) string {
-	h := sha1.New()
-	io.WriteString(h, challengeKey)
-	io.WriteString(h, wsGUID)
-	return base64.StdEncoding.EncodeToString(h.Sum(nil))
-}
-
-func handleTunnel(w http.ResponseWriter, r *http.Request) {
-	wsKey := r.Header.Get("Sec-WebSocket-Key")
+// 处理 HTTP POST 隧道 (还原为 Upgrade 请求)
+func handlePostTunnel(w http.ResponseWriter, r *http.Request) {
+	// 从 URL 参数还原 Handshake 数据
 	tsHandshake := r.URL.Query().Get("ts_handshake")
-
-	log.Printf("[TUNNEL] Starting tunnel handshake...")
-
-	if wsKey == "" || tsHandshake == "" {
-		msg := fmt.Sprintf("Missing Headers. WSKey=%v, HandshakeLen=%d", wsKey != "", len(tsHandshake))
-		log.Printf("[TUNNEL_FAIL] %s", msg)
-		http.Error(w, msg, http.StatusBadRequest)
-		return
-	}
-
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		log.Printf("[TUNNEL_FAIL] Server does not support Hijack")
-		http.Error(w, "Hijack not supported", http.StatusInternalServerError)
-		return
-	}
 	
-	// 【关键修复】获取 clientBuf (缓冲区)
-	clientConn, clientBuf, err := hj.Hijack()
-	if err != nil {
-		log.Printf("[TUNNEL_FAIL] Hijack error: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	log.Printf("[TUNNEL] Starting Tunnel via POST. HandshakeLen=%d", len(tsHandshake))
+	
+	if tsHandshake == "" {
+		http.Error(w, "Missing Handshake", http.StatusBadRequest)
 		return
 	}
 
+	// 1. 建立到 Headscale 的 TCP 连接
 	destConn, err := net.DialTimeout("tcp", targetHost, 5*time.Second)
 	if err != nil {
 		log.Printf("[TUNNEL_FAIL] Dial Backend failed: %v", err)
-		clientConn.Close()
+		http.Error(w, "Backend Unavailable", http.StatusBadGateway)
 		return
 	}
 	defer destConn.Close()
 
-	// [A] 回复 Cloudflare 101
-	acceptKey := computeAcceptKey(wsKey)
-	respToClient := fmt.Sprintf("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", acceptKey)
-	
-	if _, err := clientConn.Write([]byte(respToClient)); err != nil {
-		log.Printf("[TUNNEL_FAIL] Write 101 to Client failed: %v", err)
-		clientConn.Close()
-		return
-	}
+	// 2. 【关键】重构原始请求报文
+	// 即使 Worker 发来的是普通 POST，我们也必须向 Headscale 发送 Upgrade 请求
+	// 同时将 X-Tailscale-Handshake 头还原
+	reqToBackend := fmt.Sprintf(
+		"POST /ts2021 HTTP/1.1\r\n"+
+		"Host: %s\r\n"+
+		"Upgrade: tailscale-control-protocol\r\n"+
+		"Connection: Upgrade\r\n"+
+		"X-Tailscale-Handshake: %s\r\n"+
+		"\r\n", 
+		targetHost, tsHandshake)
 
-	// [B] 发送请求给 Headscale
-	reqToBackend := fmt.Sprintf("POST /ts2021 HTTP/1.1\r\nHost: %s\r\nUpgrade: tailscale-control-protocol\r\nConnection: Upgrade\r\nX-Tailscale-Handshake: %s\r\n\r\n", targetHost, tsHandshake)
-
+	// 发送 Header
 	if _, err := destConn.Write([]byte(reqToBackend)); err != nil {
-		log.Printf("[TUNNEL_FAIL] Write Handshake to Backend failed: %v", err)
-		clientConn.Close()
+		log.Printf("[TUNNEL_FAIL] Write Header failed: %v", err)
 		return
 	}
 
-	// [C] 消费 Headscale 响应头
+	// 3. 【关键】透传 Body (Noise 握手数据)
+	// Cloudflare 发来的 Body 包含了客户端生成的 Noise 协议数据包
+	// 我们必须把它写进 TCP 连接，否则 Headscale 无法解密
+	go func() {
+		if _, err := io.Copy(destConn, r.Body); err != nil {
+			log.Printf("[TUNNEL] Copy Body to Backend error: %v", err)
+		}
+	}()
+
+	// 4. 处理 Headscale 的响应
+	// Headscale 会返回 HTTP 101，我们需要读取它但不要发给 Worker
+	// 因为 Worker 期望的是 200 OK 的数据流
 	br := bufio.NewReader(destConn)
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil {
 			log.Printf("[TUNNEL_FAIL] Read Backend Header failed: %v", err)
-			clientConn.Close()
 			return 
 		}
+		// 遇到空行表示 Header 结束
 		if line == "\r\n" {
 			break
 		}
 	}
-
-	log.Printf("[TUNNEL] Handshake success! Piping data...")
-
-	// [D] 管道转发
-	errChan := make(chan error, 2)
 	
-	// Client -> Headscale
-	go func() {
-		// 【关键修复】先清空缓冲区，再读 Socket
-		// 如果不加上这一步，Headscale 将永远收不到第一个数据包，导致死锁/502
-		if clientBuf.Reader.Buffered() > 0 {
-			if _, err := io.Copy(destConn, clientBuf); err != nil {
-				errChan <- err
-				return
-			}
-		}
-		
-		// 缓冲区读完后，继续读 TCP 连接
-		_, copyErr := io.Copy(destConn, clientConn)
-		errChan <- copyErr
-	}()
-	
-	// Headscale -> Client
-	go func() {
-		_, copyErr := br.WriteTo(clientConn)
-		errChan <- copyErr
-	}()
+	log.Printf("[TUNNEL] Headscale handshake accepted. Streaming data...")
 
-	tunnelErr := <-errChan
-	log.Printf("[TUNNEL_END] Connection closed: %v", tunnelErr)
-	clientConn.Close()
+	// 5. 设置响应头并开启流式传输
+	// 返回 200 OK 给 Worker，并禁用缓存
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("X-Accel-Buffering", "no") // 禁用 Nginx 缓冲(如果由的话)
+	w.WriteHeader(http.StatusOK)
+	
+	// 立即刷新 Header，确保 Worker 收到 200
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	// 6. 将 Headscale 的 TCP 数据流写回给 HTTP Response
+	// 这里使用的是 br.WriteTo，因为它包含缓冲中已读取的部分 + 后续数据
+	_, err = br.WriteTo(w)
+	if err != nil {
+		log.Printf("[TUNNEL_END] Stream closed: %v", err)
+	}
 }
 
 func handleRequest(w http.ResponseWriter, r *http.Request) {
-	upgrade := r.Header.Get("Upgrade")
-	handshakeParam := r.URL.Query().Get("ts_handshake")
+	// 识别 Worker 发来的自定义头
+	isTunnelMode := r.Header.Get("X-Tunnel-Mode") == "true"
 	
-	log.Printf("[REQ] Method=%s URL=%s Upgrade=%s HandshakeParam=%v", 
-		r.Method, r.URL.Path, upgrade, handshakeParam != "")
+	log.Printf("[REQ] Method=%s URL=%s Tunnel=%v", r.Method, r.URL.Path, isTunnelMode)
 
-	isWS := strings.Contains(strings.ToLower(upgrade), "websocket")
-	hasHandshake := handshakeParam != ""
-
-	if isWS && hasHandshake {
-		log.Printf("[ROUTER] Matched -> Tunnel Mode")
-		handleTunnel(w, r)
+	if isTunnelMode {
+		handlePostTunnel(w, r)
 	} else {
-		log.Printf("[ROUTER] Default -> Standard Proxy Mode")
 		standardProxy.ServeHTTP(w, r)
 	}
 }
@@ -173,7 +140,9 @@ func main() {
 	server := &http.Server{
 		Addr:    ":" + port,
 		Handler: http.HandlerFunc(handleRequest),
+		// 增加超时，保证长连接不中断
+		IdleTimeout: 300 * time.Second,
 	}
-	log.Printf("Fixed-Proxy listening on :%s", port)
+	log.Printf("Strict-Proxy listening on :%s", port)
 	log.Fatal(server.ListenAndServe())
 }
