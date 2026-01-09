@@ -4,7 +4,9 @@ WORKDIR /app
 COPY proxy.go .
 
 # 初始化一个临时的 go module，确保依赖解析正常
-RUN go mod init proxy
+RUN go mod init proxy \
+    && go get github.com/gorilla/websocket \
+    && go mod tidy
 
 # CGO_ENABLED=0 确保静态链接，不依赖系统库
 # -s -w 去除调试符号，减小体积
