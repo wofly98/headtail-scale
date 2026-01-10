@@ -2,17 +2,16 @@ package main
 
 import (
 	"encoding/base64"
-	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/gorilla/websocket"
 )
 
+// Headscale 本地地址
 const headscaleTarget = "127.0.0.1:8080"
 
 var upgrader = websocket.Upgrader{
@@ -20,63 +19,45 @@ var upgrader = websocket.Upgrader{
 }
 
 func handleTunnel(w http.ResponseWriter, r *http.Request) {
+	// 1. 建立 WebSocket 连接
 	wsConn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("Upgrade Error: %v", err)
+		log.Printf("WS Upgrade Failed: %v", err)
 		return
 	}
 	defer wsConn.Close()
 
+	// 2. 连接本地 Headscale
 	tcpConn, err := net.Dial("tcp", headscaleTarget)
 	if err != nil {
-		log.Printf("Dial Target Error: %v", err)
+		log.Printf("Dial Headscale Failed: %v", err)
 		return
 	}
 	defer tcpConn.Close()
 
-	log.Printf("[Tunnel] Connected.")
+	log.Printf("[Server] Tunnel Connected: %s -> %s", r.RemoteAddr, headscaleTarget)
 
-	errChan := make(chan error, 3)
+	errChan := make(chan error, 2)
 
-	// --- 心跳保活协程 ---
-	// 每 10 秒发送一个 KeepAlive 帧，防止中间路由(Cloudflare/Koyeb)断开空闲连接
-	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				// 发送一个特殊的 Base64 包 "KEEP_ALIVE"
-				// Worker 尝试解码时会失败或得到无意义数据，这都没关系，关键是有流量通过
-				// "KEEP_ALIVE" 不是有效的 Base64，Worker 会抛错并忽略，完美。
-				if err := wsConn.WriteMessage(websocket.TextMessage, []byte("KEEP_ALIVE")); err != nil {
-					return
-				}
-			}
-		}
-	}()
-
-	// --- A: WS -> TCP ---
+	// --- 接收方向：WS(Base64) -> TCP(Raw) ---
 	go func() {
 		for {
-			_, message, err := wsConn.ReadMessage()
+			_, msg, err := wsConn.ReadMessage()
 			if err != nil {
-				if err != io.EOF && !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-					log.Printf("[Rx] WS Error: %v", err)
-				}
 				errChan <- err
 				return
 			}
-
-			cleanMsg := strings.TrimSpace(string(message))
+			
+			cleanMsg := strings.TrimSpace(string(msg))
 			if len(cleanMsg) == 0 { continue }
 
+			// 解码 Base64
 			rawBytes, err := base64.StdEncoding.DecodeString(cleanMsg)
 			if err != nil {
-				// 尝试 Raw 解码
+				// 容错：尝试 Raw 解码
 				rawBytes, err = base64.RawStdEncoding.DecodeString(cleanMsg)
 				if err != nil {
-					// 忽略解码错误 (可能是心跳包或其他干扰)
+					log.Printf("Decode Error: %v", err)
 					continue
 				}
 			}
@@ -88,17 +69,18 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// --- B: TCP -> WS ---
+	// --- 发送方向：TCP(Raw) -> WS(Base64) ---
 	go func() {
-		buffer := make([]byte, 32*1024)
+		buf := make([]byte, 32*1024)
 		for {
-			n, err := tcpConn.Read(buffer)
+			n, err := tcpConn.Read(buf)
 			if err != nil {
 				errChan <- err
 				return
 			}
-			encodedMsg := base64.StdEncoding.EncodeToString(buffer[:n])
-			if err := wsConn.WriteMessage(websocket.TextMessage, []byte(encodedMsg)); err != nil {
+			// 编码 Base64 发送
+			encoded := base64.StdEncoding.EncodeToString(buf[:n])
+			if err := wsConn.WriteMessage(websocket.TextMessage, []byte(encoded)); err != nil {
 				errChan <- err
 				return
 			}
@@ -106,7 +88,7 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	<-errChan
-	log.Printf("[Tunnel] Closed")
+	log.Printf("[Server] Tunnel Closed")
 }
 
 func main() {
@@ -115,6 +97,6 @@ func main() {
 		port = "8000"
 	}
 	http.HandleFunc("/tunnel", handleTunnel)
-	log.Printf("KeepAlive-Tunnel listening on :%s", port)
+	log.Printf("Tunnel Server (proxy.go) listening on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
