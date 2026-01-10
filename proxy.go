@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -19,106 +20,93 @@ var upgrader = websocket.Upgrader{
 }
 
 func handleTunnel(w http.ResponseWriter, r *http.Request) {
-	// 1. 升级 WebSocket
-	// err 第一次声明
 	wsConn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("WS Upgrade Failed: %v", err)
+		log.Printf("Upgrade Error: %v", err)
 		return
 	}
 	defer wsConn.Close()
 
-	// 2. 连接 TCP
-	// err 复用 (因为 tcpConn 是新变量，所以用 := 是合法的)
 	tcpConn, err := net.Dial("tcp", headscaleTarget)
 	if err != nil {
-		log.Printf("Dial Target Failed: %v", err)
+		log.Printf("Dial Target Error: %v", err)
 		return
 	}
 	defer tcpConn.Close()
 
-	log.Printf("[Tunnel] Connected. Proxying...")
+	log.Printf("[Tunnel] Connected.")
 
-	errChan := make(chan error, 2)
+	errChan := make(chan error, 3)
 
-	// --- 协程 A: WS (Base64) -> TCP (Raw) ---
+	// --- 心跳保活协程 ---
+	// 每 10 秒发送一个 KeepAlive 帧，防止中间路由(Cloudflare/Koyeb)断开空闲连接
 	go func() {
-		// 关闭 TCP 写端，通知 Headscale 数据发完了 (EOF)
-		defer func() {
-			if c, ok := tcpConn.(*net.TCPConn); ok {
-				c.CloseWrite()
-			}
-		}()
-
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
 		for {
-			_, message, readErr := wsConn.ReadMessage()
-			if readErr != nil {
-				// 忽略正常的关闭错误
-				if readErr != io.EOF && !websocket.IsCloseError(readErr, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-					log.Printf("[Rx] WS Read Error: %v", readErr)
+			select {
+			case <-ticker.C:
+				// 发送一个特殊的 Base64 包 "KEEP_ALIVE"
+				// Worker 尝试解码时会失败或得到无意义数据，这都没关系，关键是有流量通过
+				// "KEEP_ALIVE" 不是有效的 Base64，Worker 会抛错并忽略，完美。
+				if err := wsConn.WriteMessage(websocket.TextMessage, []byte("KEEP_ALIVE")); err != nil {
+					return
 				}
-				errChan <- readErr
+			}
+		}
+	}()
+
+	// --- A: WS -> TCP ---
+	go func() {
+		for {
+			_, message, err := wsConn.ReadMessage()
+			if err != nil {
+				if err != io.EOF && !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+					log.Printf("[Rx] WS Error: %v", err)
+				}
+				errChan <- err
 				return
 			}
 
-			// 清理并解码
 			cleanMsg := strings.TrimSpace(string(message))
-			if len(cleanMsg) == 0 {
-				continue
-			}
+			if len(cleanMsg) == 0 { continue }
 
-			// 显式声明变量，避免作用域混淆
-			var rawBytes []byte
-			var decodeErr error
-
-			// 尝试标准解码
-			rawBytes, decodeErr = base64.StdEncoding.DecodeString(cleanMsg)
-			if decodeErr != nil {
+			rawBytes, err := base64.StdEncoding.DecodeString(cleanMsg)
+			if err != nil {
 				// 尝试 Raw 解码
-				rawBytes, decodeErr = base64.RawStdEncoding.DecodeString(cleanMsg)
-				if decodeErr != nil {
-					log.Printf("[Rx] Base64 Decode Fail: %v", decodeErr)
+				rawBytes, err = base64.RawStdEncoding.DecodeString(cleanMsg)
+				if err != nil {
+					// 忽略解码错误 (可能是心跳包或其他干扰)
 					continue
 				}
 			}
 
-			n, writeErr := tcpConn.Write(rawBytes)
-			if writeErr != nil {
-				log.Printf("[Rx] TCP Write Fail: %v", writeErr)
-				errChan <- writeErr
+			if _, err := tcpConn.Write(rawBytes); err != nil {
+				errChan <- err
 				return
 			}
-			log.Printf("[Rx] Forwarded %d bytes to Headscale", n)
 		}
 	}()
 
-	// --- 协程 B: TCP (Raw) -> WS (Base64) ---
+	// --- B: TCP -> WS ---
 	go func() {
 		buffer := make([]byte, 32*1024)
 		for {
-			n, readErr := tcpConn.Read(buffer)
-			if readErr != nil {
-				if readErr != io.EOF {
-					log.Printf("[Tx] TCP Read Fail: %v", readErr)
-				}
-				errChan <- readErr
+			n, err := tcpConn.Read(buffer)
+			if err != nil {
+				errChan <- err
 				return
 			}
-			
-			log.Printf("[Tx] Got %d bytes from Headscale", n)
-
 			encodedMsg := base64.StdEncoding.EncodeToString(buffer[:n])
-			if writeErr := wsConn.WriteMessage(websocket.TextMessage, []byte(encodedMsg)); writeErr != nil {
-				log.Printf("[Tx] WS Write Fail: %v", writeErr)
-				errChan <- writeErr
+			if err := wsConn.WriteMessage(websocket.TextMessage, []byte(encodedMsg)); err != nil {
+				errChan <- err
 				return
 			}
 		}
 	}()
 
-	// 【关键修复】使用新变量名 exitErr，避免与函数顶部的 err 冲突
-	exitErr := <-errChan
-	log.Printf("[Tunnel] Closed. Reason: %v", exitErr)
+	<-errChan
+	log.Printf("[Tunnel] Closed")
 }
 
 func main() {
@@ -127,6 +115,6 @@ func main() {
 		port = "8000"
 	}
 	http.HandleFunc("/tunnel", handleTunnel)
-	log.Printf("Fixed-Tunnel listening on :%s", port)
+	log.Printf("KeepAlive-Tunnel listening on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
