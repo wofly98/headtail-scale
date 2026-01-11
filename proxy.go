@@ -7,19 +7,19 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time" // 引入 time
 
 	"github.com/gorilla/websocket"
 )
 
-// Headscale 本地地址
 const headscaleTarget = "127.0.0.1:8080"
+const timeoutDuration = 60 * time.Second // 60秒无数据则断开
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
 func handleTunnel(w http.ResponseWriter, r *http.Request) {
-	// 1. 建立 WebSocket 连接
 	wsConn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("WS Upgrade Failed: %v", err)
@@ -27,7 +27,6 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	}
 	defer wsConn.Close()
 
-	// 2. 连接本地 Headscale
 	tcpConn, err := net.Dial("tcp", headscaleTarget)
 	if err != nil {
 		log.Printf("Dial Headscale Failed: %v", err)
@@ -35,11 +34,19 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tcpConn.Close()
 
-	log.Printf("[Server] Tunnel Connected: %s -> %s", r.RemoteAddr, headscaleTarget)
+	log.Printf("[Server] Tunnel Connected: %s", r.RemoteAddr)
+
+	// 【关键】设置 Pong 处理函数：收到客户端的 Ping/Pong 自动延长超时时间
+	wsConn.SetReadDeadline(time.Now().Add(timeoutDuration))
+	wsConn.SetPongHandler(func(string) error {
+		wsConn.SetReadDeadline(time.Now().Add(timeoutDuration))
+		return nil
+	})
+    // 收到 Ping 也会自动回复 Pong，Gorilla 库底层已处理
 
 	errChan := make(chan error, 2)
 
-	// --- 接收方向：WS(Base64) -> TCP(Raw) ---
+	// --- 接收方向 ---
 	go func() {
 		for {
 			_, msg, err := wsConn.ReadMessage()
@@ -48,18 +55,16 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			
+			// 【关键】每收到一次数据，就重置超时时间
+			wsConn.SetReadDeadline(time.Now().Add(timeoutDuration))
+
 			cleanMsg := strings.TrimSpace(string(msg))
 			if len(cleanMsg) == 0 { continue }
 
-			// 解码 Base64
 			rawBytes, err := base64.StdEncoding.DecodeString(cleanMsg)
 			if err != nil {
-				// 容错：尝试 Raw 解码
 				rawBytes, err = base64.RawStdEncoding.DecodeString(cleanMsg)
-				if err != nil {
-					log.Printf("Decode Error: %v", err)
-					continue
-				}
+				if err != nil { continue }
 			}
 
 			if _, err := tcpConn.Write(rawBytes); err != nil {
@@ -69,7 +74,7 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// --- 发送方向：TCP(Raw) -> WS(Base64) ---
+	// --- 发送方向 ---
 	go func() {
 		buf := make([]byte, 32*1024)
 		for {
@@ -78,7 +83,6 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 				errChan <- err
 				return
 			}
-			// 编码 Base64 发送
 			encoded := base64.StdEncoding.EncodeToString(buf[:n])
 			if err := wsConn.WriteMessage(websocket.TextMessage, []byte(encoded)); err != nil {
 				errChan <- err
@@ -93,10 +97,8 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8000"
-	}
+	if port == "" { port = "8000" }
 	http.HandleFunc("/tunnel", handleTunnel)
-	log.Printf("Tunnel Server (proxy.go) listening on :%s", port)
+	log.Printf("Heartbeat-Server listening on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
