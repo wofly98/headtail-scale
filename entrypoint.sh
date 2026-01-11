@@ -65,6 +65,7 @@ if [ -z "$AUTHKEY" ]; then
     exit 1
 fi
 echo "获取到 Key: ${AUTHKEY}" 
+echo ${AUTHKEY}>/authkey
 
 # --- 第四步：启动 Tailscale 并连接 ---
 # 启动 tailscaled 守护进程 (需要特权模式或 TUN 设备支持)
