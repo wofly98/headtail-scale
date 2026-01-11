@@ -42,7 +42,7 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 		wsConn.SetReadDeadline(time.Now().Add(timeoutDuration))
 		return nil
 	})
-    // 收到 Ping 也会自动回复 Pong，Gorilla 库底层已处理
+	// 收到 Ping 也会自动回复 Pong，Gorilla 库底层已处理
 
 	errChan := make(chan error, 2)
 
@@ -54,17 +54,21 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 				errChan <- err
 				return
 			}
-			
+
 			// 【关键】每收到一次数据，就重置超时时间
 			wsConn.SetReadDeadline(time.Now().Add(timeoutDuration))
 
 			cleanMsg := strings.TrimSpace(string(msg))
-			if len(cleanMsg) == 0 { continue }
+			if len(cleanMsg) == 0 {
+				continue
+			}
 
 			rawBytes, err := base64.StdEncoding.DecodeString(cleanMsg)
 			if err != nil {
 				rawBytes, err = base64.RawStdEncoding.DecodeString(cleanMsg)
-				if err != nil { continue }
+				if err != nil {
+					continue
+				}
 			}
 
 			if _, err := tcpConn.Write(rawBytes); err != nil {
@@ -95,10 +99,22 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[Server] Tunnel Closed")
 }
 
+func handleGetKey(w http.ResponseWriter, r *http.Request) {
+	data, err := os.ReadFile("/authkey")
+	if err != nil {
+		http.Error(w, "404 Not Found", http.StatusNotFound)
+		return
+	}
+	w.Write(data)
+}
+
 func main() {
 	port := os.Getenv("PORT")
-	if port == "" { port = "8000" }
+	if port == "" {
+		port = "8000"
+	}
 	http.HandleFunc("/tunnel", handleTunnel)
+	http.HandleFunc("/getkey", handleGetKey)
 	log.Printf("Heartbeat-Server listening on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
