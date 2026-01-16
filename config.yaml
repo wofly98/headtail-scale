@@ -7,7 +7,7 @@ grpc_allow_insecure: true  # Koyeb TLS 终止后允许明文 gRPC
 
 # 必须添加：IP 前缀（至少一个 IPv4 或 IPv6，修复你的错误）
 prefixes:
-  v4: 192.168.100.0/24  # 默认 IPv4 范围（CGNAT）
+  v4: 100.64.0.0/10  # 默认 IPv4 范围（CGNAT）
   v6: fd12:3456:789a::/48  # 默认 IPv6 范围（ULA）
   allocation: sequential  # 分配策略：sequential 或 random
 
