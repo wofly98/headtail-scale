@@ -44,7 +44,8 @@ RUN mkdir -p /var/lib/headscale /var/lib/tailscale /var/run/tailscale /etc/heads
 # 复制启动脚本
 COPY config.yaml /etc/headscale/config.yaml
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+# 转换 Windows 行尾符为 Unix 格式
+RUN apk add --no-cache dos2unix && dos2unix /entrypoint.sh && chmod +x /entrypoint.sh
 
 # 暴露端口 (Headscale 默认端口)
 EXPOSE 8000
