@@ -9,14 +9,14 @@ if [ -n "$KOYEB_PUBLIC_DOMAIN" ]; then
 elif [ -n "$HEADSCALE_SERVER_URL" ]; then
     log "使用环境变量 server_url: $HEADSCALE_SERVER_URL"
 else
-    export HEADSCALE_SERVER_URL="http://localhost:8080"
+    export HEADSCALE_SERVER_URL="http://localhost:8180"
     warn "未检测到公网域名，使用本地地址 (仅测试用)"
 fi
 
 if [ -n "$LOCAL_LOGIN_URL" ]; then
     log "使用环境变量 login_url: $LOCAL_LOGIN_URL"
 else
-    export LOCAL_LOGIN_URL="http://localhost:8080"
+    export LOCAL_LOGIN_URL="http://localhost:8180"
     warn "未检测到公网域名，使用本地地址 (仅测试用)"
 fi
 
@@ -33,7 +33,7 @@ HEADSCALE_PID=$!
 
 # --- 第二步：等待 Headscale 就绪 ---
 echo "等待 Headscale 启动..."
-until curl -s http://127.0.0.1:8080/health > /dev/null; do
+until curl -s http://127.0.0.1:8180/health > /dev/null; do
     sleep 1
     echo "..."
 done

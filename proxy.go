@@ -12,7 +12,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const headscaleTarget = "127.0.0.1:8080"
+const headscaleTarget = "127.0.0.1:8180"
 const timeoutDuration = 60 * time.Second // 60秒无数据则断开
 
 var upgrader = websocket.Upgrader{
