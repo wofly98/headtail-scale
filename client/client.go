@@ -2,7 +2,7 @@ package main
 
 import (
 	"encoding/base64"
-	"flag"
+	"encoding/json"
 	"log"
 	"net"
 	"os"
@@ -13,10 +13,20 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-var (
-	localAddr  = flag.String("l", ":44300", "本地监听地址")
-	remoteAddr = flag.String("s", "wss://past-adelice-godsheaven-2114a06f.koyeb.app/tunnel", "远程 WebSocket 地址")
-)
+type Config struct {
+	LocalAddr  string `json:"localAddr"`
+	RemoteAddr string `json:"remoteAddr"`
+}
+
+var config Config
+
+func loadConfig() error {
+	data, err := os.ReadFile("config.json")
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, &config)
+}
 
 func handleClient(localConn net.Conn) {
 	defer localConn.Close()
@@ -25,7 +35,7 @@ func handleClient(localConn net.Conn) {
 	// 1. 连接远程 WebSocket
 	dialer := websocket.DefaultDialer
 	dialer.HandshakeTimeout = 10 * time.Second
-	wsConn, _, err := dialer.Dial(*remoteAddr, nil)
+	wsConn, _, err := dialer.Dial(config.RemoteAddr, nil)
 	if err != nil {
 		log.Printf("[Client] Dial Failed: %v", err)
 		return
@@ -81,12 +91,16 @@ func handleClient(localConn net.Conn) {
 				errChan <- err
 				return
 			}
-			
+
 			cleanMsg := strings.TrimSpace(string(msg))
-			if len(cleanMsg) == 0 { continue }
+			if len(cleanMsg) == 0 {
+				continue
+			}
 
 			rawBytes, err := base64.StdEncoding.DecodeString(cleanMsg)
-			if err != nil { continue }
+			if err != nil {
+				continue
+			}
 
 			if _, err := localConn.Write(rawBytes); err != nil {
 				errChan <- err
@@ -100,11 +114,15 @@ func handleClient(localConn net.Conn) {
 }
 
 func main() {
-	flag.Parse()
-	listener, err := net.Listen("tcp", *localAddr)
-	if err != nil { log.Fatal(err) }
+	if err := loadConfig(); err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
+	listener, err := net.Listen("tcp", config.LocalAddr)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	log.Printf("== Heartbeat Client Started on %s ==", *localAddr)
+	log.Printf("== Heartbeat Client Started on %s ==", config.LocalAddr)
 
 	go func() {
 		c := make(chan os.Signal, 1)

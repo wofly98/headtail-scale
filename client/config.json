@@ -1,0 +1,4 @@
+{
+    "localAddr": ":44300",
+    "remoteAddr": "wss://proxy.node/tunnel"
+}
