@@ -12,6 +12,13 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 const headscaleTarget = "127.0.0.1:8180"
 const timeoutDuration = 60 * time.Second // 60秒无数据则断开
 
@@ -20,19 +27,22 @@ var upgrader = websocket.Upgrader{
 }
 
 func handleTunnel(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[Server] New tunnel request from: %s, Path: %s", r.RemoteAddr, r.URL.Path)
 	wsConn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("WS Upgrade Failed: %v", err)
+		log.Printf("[Server] WS Upgrade Failed: %v", err)
 		return
 	}
 	defer wsConn.Close()
+	log.Printf("[Server] WebSocket upgraded successfully")
 
 	tcpConn, err := net.Dial("tcp", headscaleTarget)
 	if err != nil {
-		log.Printf("Dial Headscale Failed: %v", err)
+		log.Printf("[Server] Dial Headscale Failed: %v", err)
 		return
 	}
 	defer tcpConn.Close()
+	log.Printf("[Server] Connected to target: %s", headscaleTarget)
 
 	log.Printf("[Server] Tunnel Connected: %s", r.RemoteAddr)
 
@@ -51,6 +61,7 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 		for {
 			_, msg, err := wsConn.ReadMessage()
 			if err != nil {
+				log.Printf("[Server] Receive Direction: WebSocket Read Error: %v", err)
 				errChan <- err
 				return
 			}
@@ -60,21 +71,29 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 
 			cleanMsg := strings.TrimSpace(string(msg))
 			if len(cleanMsg) == 0 {
+				log.Printf("[Server] Receive Direction: Received empty message, skipping")
 				continue
 			}
 
+			log.Printf("[Server] Receive Direction: Received %d bytes from WebSocket", len(cleanMsg))
 			rawBytes, err := base64.StdEncoding.DecodeString(cleanMsg)
 			if err != nil {
+				log.Printf("[Server] Receive Direction: Base64 Decode Error (Std): %v", err)
 				rawBytes, err = base64.RawStdEncoding.DecodeString(cleanMsg)
 				if err != nil {
+					log.Printf("[Server] Receive Direction: Base64 Decode Error (Raw): %v", err)
 					continue
 				}
 			}
+			log.Printf("[Server] Receive Direction: Decoded to %d bytes", len(rawBytes))
+			log.Printf("[Server] Receive Direction: Data preview (first 200 bytes): %s", string(rawBytes[:min(len(rawBytes), 200)]))
 
 			if _, err := tcpConn.Write(rawBytes); err != nil {
+				log.Printf("[Server] Receive Direction: TCP Write Error: %v", err)
 				errChan <- err
 				return
 			}
+			log.Printf("[Server] Receive Direction: Successfully wrote %d bytes to target", len(rawBytes))
 		}
 	}()
 
@@ -84,14 +103,20 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 		for {
 			n, err := tcpConn.Read(buf)
 			if err != nil {
+				log.Printf("[Server] Send Direction: TCP Read Error: %v", err)
 				errChan <- err
 				return
 			}
+			log.Printf("[Server] Send Direction: Read %d bytes from target", n)
+			log.Printf("[Server] Send Direction: Data preview (first 200 bytes): %s", string(buf[:min(n, 200)]))
 			encoded := base64.StdEncoding.EncodeToString(buf[:n])
+			log.Printf("[Server] Send Direction: Encoded to %d bytes, sending to WebSocket", len(encoded))
 			if err := wsConn.WriteMessage(websocket.TextMessage, []byte(encoded)); err != nil {
+				log.Printf("[Server] Send Direction: WebSocket Write Error: %v", err)
 				errChan <- err
 				return
 			}
+			log.Printf("[Server] Send Direction: Successfully sent to WebSocket")
 		}
 	}()
 
