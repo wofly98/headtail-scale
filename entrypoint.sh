@@ -5,19 +5,19 @@ TS_HOSTNAME="koyeb-server"
 # 自动检测 Koyeb 公网域名
 if [ -n "$KOYEB_PUBLIC_DOMAIN" ]; then
     export HEADSCALE_SERVER_URL="https://${KOYEB_PUBLIC_DOMAIN}"
-    log "检测到 Koyeb 域名: $HEADSCALE_SERVER_URL"
+    echo "检测到 Koyeb 域名: $HEADSCALE_SERVER_URL"
 elif [ -n "$HEADSCALE_SERVER_URL" ]; then
-    log "使用环境变量 server_url: $HEADSCALE_SERVER_URL"
+    echo "使用环境变量 server_url: $HEADSCALE_SERVER_URL"
 else
     export HEADSCALE_SERVER_URL="http://localhost:8180"
-    warn "未检测到公网域名，使用本地地址 (仅测试用)"
+    echo "未检测到公网域名，使用本地地址 (仅测试用)"
 fi
 
 if [ -n "$LOCAL_LOGIN_URL" ]; then
-    log "使用环境变量 login_url: $LOCAL_LOGIN_URL"
+    echo "使用环境变量 login_url: $LOCAL_LOGIN_URL"
 else
     export LOCAL_LOGIN_URL="http://localhost:8180"
-    warn "未检测到公网域名，使用本地地址 (仅测试用)"
+    echo "未检测到公网域名，使用本地地址 (仅测试用)"
 fi
 
 # 开启错误追踪，便于调试
