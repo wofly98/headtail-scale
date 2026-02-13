@@ -7,134 +7,96 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"time" // 引入 time
+	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 const headscaleTarget = "127.0.0.1:8180"
-const timeoutDuration = 60 * time.Second // 60秒无数据则断开
+const timeoutDuration = 60 * time.Second
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
 func handleTunnel(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[Server] New tunnel request from: %s, Path: %s", r.RemoteAddr, r.URL.Path)
 	wsConn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("[Server] WS Upgrade Failed: %v", err)
 		return
 	}
 	defer wsConn.Close()
-	log.Printf("[Server] WebSocket upgraded successfully")
 
 	tcpConn, err := net.Dial("tcp", headscaleTarget)
 	if err != nil {
-		log.Printf("[Server] Dial Headscale Failed: %v", err)
+		log.Printf("[Server] Dial Target Failed: %v", err)
 		return
 	}
 	defer tcpConn.Close()
-	log.Printf("[Server] Connected to target: %s", headscaleTarget)
 
-	log.Printf("[Server] Tunnel Connected: %s", r.RemoteAddr)
+	log.Printf("[Server] Tunnel Connected: %s -> %s", r.RemoteAddr, headscaleTarget)
 
-	// 【关键】设置 Pong 处理函数：收到客户端的 Ping/Pong 自动延长超时时间
+	// 设置超时和心跳处理
 	wsConn.SetReadDeadline(time.Now().Add(timeoutDuration))
-	log.Printf("[Server] Timeout: Initial read deadline set to %v", timeoutDuration)
-
-	pingCount := 0
-	wsConn.SetPingHandler(func(appData string) error {
-		pingCount++
-		log.Printf("[Server] Heartbeat: Received Ping #%d from client", pingCount)
-		// 自动回复 Pong
-		return wsConn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(5*time.Second))
-	})
-
-	wsConn.SetPongHandler(func(appData string) error {
-		log.Printf("[Server] Heartbeat: Received Pong from client")
+	wsConn.SetPongHandler(func(string) error {
 		wsConn.SetReadDeadline(time.Now().Add(timeoutDuration))
-		log.Printf("[Server] Timeout: Read deadline extended by %v", timeoutDuration)
 		return nil
 	})
-	// 收到 Ping 也会自动回复 Pong，Gorilla 库底层已处理
 
 	errChan := make(chan error, 2)
 
-	// --- 接收方向 ---
+	// --- 接收方向：WebSocket -> Target ---
 	go func() {
 		for {
 			_, msg, err := wsConn.ReadMessage()
 			if err != nil {
-				log.Printf("[Server] Receive Direction: WebSocket Read Error: %v", err)
 				errChan <- err
 				return
 			}
 
-			// 【关键】每收到一次数据，就重置超时时间
 			wsConn.SetReadDeadline(time.Now().Add(timeoutDuration))
-			log.Printf("[Server] Timeout: Read deadline reset due to data received")
 
 			cleanMsg := strings.TrimSpace(string(msg))
 			if len(cleanMsg) == 0 {
-				log.Printf("[Server] Receive Direction: Received empty message, skipping")
 				continue
 			}
 
-			log.Printf("[Server] Receive Direction: Received %d bytes from WebSocket", len(cleanMsg))
 			rawBytes, err := base64.StdEncoding.DecodeString(cleanMsg)
 			if err != nil {
-				log.Printf("[Server] Receive Direction: Base64 Decode Error (Std): %v", err)
 				rawBytes, err = base64.RawStdEncoding.DecodeString(cleanMsg)
 				if err != nil {
-					log.Printf("[Server] Receive Direction: Base64 Decode Error (Raw): %v", err)
 					continue
 				}
 			}
-			log.Printf("[Server] Receive Direction: Decoded to %d bytes", len(rawBytes))
-			log.Printf("[Server] Receive Direction: Data preview (first 200 bytes): %s", string(rawBytes[:min(len(rawBytes), 200)]))
 
 			if _, err := tcpConn.Write(rawBytes); err != nil {
-				log.Printf("[Server] Receive Direction: TCP Write Error: %v", err)
 				errChan <- err
 				return
 			}
-			log.Printf("[Server] Receive Direction: Successfully wrote %d bytes to target", len(rawBytes))
 		}
 	}()
 
-	// --- 发送方向 ---
+	// --- 发送方向：Target -> WebSocket ---
 	go func() {
 		buf := make([]byte, 32*1024)
 		for {
 			n, err := tcpConn.Read(buf)
 			if err != nil {
-				log.Printf("[Server] Send Direction: TCP Read Error: %v", err)
 				errChan <- err
 				return
 			}
-			log.Printf("[Server] Send Direction: Read %d bytes from target", n)
-			log.Printf("[Server] Send Direction: Data preview (first 200 bytes): %s", string(buf[:min(n, 200)]))
 			encoded := base64.StdEncoding.EncodeToString(buf[:n])
-			log.Printf("[Server] Send Direction: Encoded to %d bytes, sending to WebSocket", len(encoded))
 			if err := wsConn.WriteMessage(websocket.TextMessage, []byte(encoded)); err != nil {
-				log.Printf("[Server] Send Direction: WebSocket Write Error: %v", err)
 				errChan <- err
 				return
 			}
-			log.Printf("[Server] Send Direction: Successfully sent to WebSocket")
 		}
 	}()
 
 	err = <-errChan
-	log.Printf("[Server] Tunnel Closed: %v", err)
+	if err != nil {
+		log.Printf("[Server] Tunnel Closed: %v", err)
+	}
 }
 
 func handleGetKey(w http.ResponseWriter, r *http.Request) {
@@ -153,6 +115,6 @@ func main() {
 	}
 	http.HandleFunc("/tunnel", handleTunnel)
 	http.HandleFunc("/getkey", handleGetKey)
-	log.Printf("Heartbeat-Server listening on :%s", port)
+	log.Printf("Server listening on :%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
