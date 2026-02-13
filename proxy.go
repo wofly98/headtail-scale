@@ -48,8 +48,20 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 
 	// 【关键】设置 Pong 处理函数：收到客户端的 Ping/Pong 自动延长超时时间
 	wsConn.SetReadDeadline(time.Now().Add(timeoutDuration))
-	wsConn.SetPongHandler(func(string) error {
+	log.Printf("[Server] Timeout: Initial read deadline set to %v", timeoutDuration)
+
+	pingCount := 0
+	wsConn.SetPingHandler(func(appData string) error {
+		pingCount++
+		log.Printf("[Server] Heartbeat: Received Ping #%d from client", pingCount)
+		// 自动回复 Pong
+		return wsConn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(5*time.Second))
+	})
+
+	wsConn.SetPongHandler(func(appData string) error {
+		log.Printf("[Server] Heartbeat: Received Pong from client")
 		wsConn.SetReadDeadline(time.Now().Add(timeoutDuration))
+		log.Printf("[Server] Timeout: Read deadline extended by %v", timeoutDuration)
 		return nil
 	})
 	// 收到 Ping 也会自动回复 Pong，Gorilla 库底层已处理
@@ -68,6 +80,7 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 
 			// 【关键】每收到一次数据，就重置超时时间
 			wsConn.SetReadDeadline(time.Now().Add(timeoutDuration))
+			log.Printf("[Server] Timeout: Read deadline reset due to data received")
 
 			cleanMsg := strings.TrimSpace(string(msg))
 			if len(cleanMsg) == 0 {
@@ -120,8 +133,8 @@ func handleTunnel(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	<-errChan
-	log.Printf("[Server] Tunnel Closed")
+	err = <-errChan
+	log.Printf("[Server] Tunnel Closed: %v", err)
 }
 
 func handleGetKey(w http.ResponseWriter, r *http.Request) {
