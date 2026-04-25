@@ -1,6 +1,6 @@
 # Headscale Docker 部署与环境配置说明
 
-本项目提供了一个集成了 Headscale 与 Tailscale 的 Docker 部署方案，主要使用 `entrypoint.sh` 在启动容器时完成自动化配置与服务拉起。
+本项目提供了一个集成了 Headscale 与 Tailscale 的 Docker 部署方案，主要使用 `entrypoint.sh` 在启动容器时完成自动化配置与服务拉起。为了更好的兼容性与国际化支持，系统启动日志已全部转换为英文。
 
 ## 环境变量配置
 
