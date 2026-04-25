@@ -23,8 +23,45 @@ fi
 # 开启错误追踪，便于调试
 set -e
 
-# 初始化数据库（如果是第一次运行）
-touch /var/lib/headscale/db.sqlite
+# 配置数据库
+if [ -n "$HEADSCALE_DB_TYPE" ]; then
+    echo "根据环境变量配置数据库类型为 $HEADSCALE_DB_TYPE ..."
+    awk -v type="$HEADSCALE_DB_TYPE" \
+        -v host="$HEADSCALE_DB_HOST" \
+        -v port="$HEADSCALE_DB_PORT" \
+        -v name="$HEADSCALE_DB_NAME" \
+        -v user="$HEADSCALE_DB_USER" \
+        -v pass="$HEADSCALE_DB_PASS" \
+        -v ssl="$HEADSCALE_DB_SSL_MODE" '
+    /^database:/ {
+        in_db = 1
+        print "database:"
+        if (type == "postgres") {
+            print "  type: postgres"
+            print "  postgres:"
+            print "    host: " (host ? host : "localhost")
+            print "    port: " (port ? port : "5432")
+            print "    name: " (name ? name : "headscale")
+            print "    user: " (user ? user : "headscale")
+            print "    pass: " (pass ? pass : "headscale")
+            print "    ssl_mode: " (ssl ? ssl : "disable")
+        } else {
+            print "  type: " type
+            print "  sqlite:"
+            print "    path: /var/lib/headscale/db.sqlite"
+        }
+        next
+    }
+    in_db && (/^[a-zA-Z0-9_-]+:/ || /^#/) { in_db = 0 }
+    in_db { next }
+    { print }
+    ' /etc/headscale/config.yaml > /tmp/config.yaml && mv /tmp/config.yaml /etc/headscale/config.yaml
+fi
+
+# 初始化数据库文件（如果当前配置为 sqlite）
+if grep -q "type: sqlite" /etc/headscale/config.yaml; then
+    touch /var/lib/headscale/db.sqlite
+fi
 
 # 启动 Headscale (放入后台运行)
 echo "启动 Headscale 服务..."
