@@ -20,8 +20,8 @@ RUN apk update && apk add --no-cache \
 
 COPY --from=builder /app/header-proxy /usr/local/bin/header-proxy
 
-# Tailscale 最新版本 (2026年1月)
-ENV TS_VERSION=1.92.3
+# Tailscale 最新版本
+ENV TS_VERSION=1.96.4
 ENV TS_ARCH=amd64
 RUN wget https://pkgs.tailscale.com/stable/tailscale_${TS_VERSION}_${TS_ARCH}.tgz && \
     tar xzf tailscale_${TS_VERSION}_${TS_ARCH}.tgz && \
@@ -29,8 +29,8 @@ RUN wget https://pkgs.tailscale.com/stable/tailscale_${TS_VERSION}_${TS_ARCH}.tg
     mv tailscale_${TS_VERSION}_${TS_ARCH}/tailscale /usr/bin/tailscale && \
     rm -rf tailscale_*
 
-# Headscale 最新版本 (0.23.0)
-ENV HEADSCALE_VERSION=0.28.0-beta.1
+# Headscale 最新版本
+ENV HEADSCALE_VERSION=0.28.0
 RUN wget https://github.com/juanfont/headscale/releases/download/v${HEADSCALE_VERSION}/headscale_${HEADSCALE_VERSION}_linux_${TS_ARCH} && \
     cp headscale_${HEADSCALE_VERSION}_linux_${TS_ARCH} headscale && \
     mv headscale /usr/bin/headscale && \
